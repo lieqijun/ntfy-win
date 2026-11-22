@@ -83,6 +83,28 @@ pub fn copy_to_clipboard(_text: &str) -> bool {
     false
 }
 
+// ---------------------------------------------------------------- 消息框
+
+/// 导入证书这类操作失败时必须说话，否则用户看到的就是「点了没反应」
+#[cfg(windows)]
+pub fn message(text: &str, title: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+
+    let text = wide(text);
+    let title = wide(title);
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONWARNING,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn message(_text: &str, _title: &str) {}
+
 #[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()

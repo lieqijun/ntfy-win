@@ -10,6 +10,8 @@ use native_windows_gui as nwg;
 use crate::config::{self, Config};
 use crate::net::NetEvent;
 
+// ---------------------------------------------------------------- DPI
+
 /// 逻辑像素 → 物理像素
 pub fn scale(v: i32) -> i32 {
     (v as f32 * dpi_factor()).round() as i32
@@ -33,6 +35,67 @@ pub fn dpi_factor() -> f32 {
     #[cfg(not(windows))]
     1.0
 }
+
+/// nwg 用的是 winapi 的 HWND，windows-sys 用的是 *mut c_void，这里转一次
+#[cfg(windows)]
+fn raw_handle(h: &nwg::ControlHandle) -> Option<*mut core::ffi::c_void> {
+    h.hwnd().map(|x| x as *mut core::ffi::c_void)
+}
+
+#[cfg(windows)]
+fn raw_hwnd(win: &nwg::Window) -> Option<*mut core::ffi::c_void> {
+    raw_handle(&win.handle)
+}
+
+/// nwg 只有在没有 parent 时才把 size 当作客户区大小；带 parent 的对话框
+/// size 是外框尺寸，标题栏会把内容挤掉一截。这里先按目标设一次，量出
+/// 外框与客户区的差值，再补回去。
+pub fn fit_client(win: &nwg::Window, cw: i32, ch: i32) {
+    let want_w = cw.max(1) as u32;
+    let want_h = ch.max(1) as u32;
+    win.set_size(want_w, want_h);
+
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
+
+        let Some(h) = raw_hwnd(win) else { return };
+        let mut wr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let mut cr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        if GetWindowRect(h, &mut wr) == 0 || GetClientRect(h, &mut cr) == 0 {
+            return;
+        }
+        let dw = (wr.right - wr.left) - (cr.right - cr.left);
+        let dh = (wr.bottom - wr.top) - (cr.bottom - cr.top);
+        win.set_size((want_w as i32 + dw).max(1) as u32, (want_h as i32 + dh).max(1) as u32);
+    }
+}
+
+/// 把 child 摆到 parent 正中（屏幕坐标）
+pub fn center_on(parent: &nwg::Window, child: &nwg::Window) {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+        let (Some(ph), Some(ch)) = (raw_hwnd(parent), raw_hwnd(child)) else {
+            return;
+        };
+        let mut pr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let mut cr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        if GetWindowRect(ph, &mut pr) == 0 || GetWindowRect(ch, &mut cr) == 0 {
+            return;
+        }
+        let w = cr.right - cr.left;
+        let h = cr.bottom - cr.top;
+        let x = pr.left + ((pr.right - pr.left) - w) / 2;
+        let y = pr.top + ((pr.bottom - pr.top) - h) / 2;
+        child.set_position(x, y);
+    }
+}
+
+// ---------------------------------------------------------------- 结构
 
 pub struct Ui {
     pub window: nwg::Window,
@@ -82,11 +145,42 @@ pub struct Ctx {
     pub tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
+// 订阅对话框客户区布局（逻辑像素）
+const DLG_W: i32 = 470;
+const FIELD_X: i32 = 100;
+const FIELD_W: i32 = 354;
+const LABEL_W: i32 = 80;
+const ROW_H: i32 = 26;
+const BTN_W: i32 = 80;
+const BTN_H: i32 = 28;
+
+const SUB_H_BASIC: i32 = 164;
+const SUB_H_ADVANCED: i32 = 236;
+const SUB_BTN_Y_BASIC: i32 = 124;
+const SUB_BTN_Y_ADVANCED: i32 = 196;
+
+const SET_H: i32 = 140;
+
 impl Ui {
     pub fn build() -> Result<(Ui, Ctx), nwg::NwgError> {
+        // 系统默认字体在中文 Windows 上是 9pt 宋体，125% 缩放下糊成一团。
+        // 换成雅黑，并且按实际 DPI 取像素高度（size_absolute 传负值），
+        // 这样字体和下面按 scale() 算出来的布局是同一套刻度。
+        let mut font = nwg::Font::default();
+        let mut font_handle: *mut core::ffi::c_void = std::ptr::null_mut();
+        if nwg::Font::builder()
+            .family("Microsoft YaHei UI")
+            .size_absolute(px(12))
+            .build(&mut font)
+            .is_ok()
+        {
+            font_handle = font.handle as *mut core::ffi::c_void;
+            let _ = nwg::Font::set_global_default(Some(font));
+        }
+
         let s = scale;
 
-        // ---------------- 主窗口 ----------------
+        // ---------------- 主窗口（无 parent，size 就是客户区） ----------------
         let mut window = nwg::Window::default();
         nwg::Window::builder()
             .size((s(480), s(348)))
@@ -98,7 +192,7 @@ impl Ui {
         nwg::ListView::builder()
             .parent(&window)
             .position((s(10), s(10)))
-            .size((s(444), s(268)))
+            .size((s(460), s(268)))
             .list_style(nwg::ListViewStyle::Detailed)
             .flags(
                 nwg::ListViewFlags::VISIBLE
@@ -112,7 +206,7 @@ impl Ui {
 
         list.insert_column(nwg::InsertListViewColumn {
             text: Some("主题".to_string()),
-            width: Some(s(140)),
+            width: Some(s(150)),
             ..Default::default()
         });
         list.insert_column(nwg::InsertListViewColumn {
@@ -121,11 +215,24 @@ impl Ui {
             ..Default::default()
         });
 
+        // nwg 没有给 ListView 留 set_font，只能自己发一次 WM_SETFONT，
+        // 否则列表行和表头还是宋体，跟下面那几个雅黑按钮不是一个风格
+        #[cfg(windows)]
+        if !font_handle.is_null() {
+            if let Some(h) = raw_handle(&list.handle) {
+                unsafe {
+                    use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
+                    const WM_SETFONT: u32 = 0x0030;
+                    SendMessageW(h, WM_SETFONT, font_handle as usize, 1);
+                }
+            }
+        }
+
         let mut btn_add = nwg::Button::default();
         nwg::Button::builder()
             .parent(&window)
             .text("订阅新主题...")
-            .position((s(150), s(288)))
+            .position((s(156), s(288)))
             .size((s(112), s(28)))
             .build(&mut btn_add)?;
 
@@ -133,7 +240,7 @@ impl Ui {
         nwg::Button::builder()
             .parent(&window)
             .text("设置...")
-            .position((s(268), s(288)))
+            .position((s(274), s(288)))
             .size((s(96), s(28)))
             .build(&mut btn_settings)?;
 
@@ -141,7 +248,7 @@ impl Ui {
         nwg::Button::builder()
             .parent(&window)
             .text("移除")
-            .position((s(370), s(288)))
+            .position((s(376), s(288)))
             .size((s(84), s(28)))
             .build(&mut btn_remove)?;
 
@@ -150,85 +257,87 @@ impl Ui {
         nwg::Window::builder()
             .parent(Some(&window))
             .flags(nwg::WindowFlags::WINDOW)
-            .size((s(460), s(152)))
+            .size((s(DLG_W), s(SUB_H_BASIC)))
             .position((s(520), s(320)))
             .title("订阅新主题")
             .build(&mut sub_dlg)?;
+        fit_client(&sub_dlg, s(DLG_W), s(SUB_H_BASIC));
+        center_on(&window, &sub_dlg);
 
         let mut sub_topic_label = nwg::Label::default();
         nwg::Label::builder()
             .parent(&sub_dlg)
             .text("主题名称:")
-            .position((s(16), s(20)))
-            .size((s(76), s(20)))
+            .position((s(16), s(17)))
+            .size((s(LABEL_W), s(20)))
             .build(&mut sub_topic_label)?;
 
         let mut sub_topic = nwg::TextInput::default();
         nwg::TextInput::builder()
             .parent(&sub_dlg)
-            .position((s(96), s(17)))
-            .size((s(344), s(26)))
+            .position((s(FIELD_X), s(14)))
+            .size((s(FIELD_W), s(ROW_H)))
             .build(&mut sub_topic)?;
 
         let mut sub_server_label = nwg::Label::default();
         nwg::Label::builder()
             .parent(&sub_dlg)
             .text("服务器:")
-            .position((s(16), s(56)))
-            .size((s(76), s(20)))
+            .position((s(16), s(55)))
+            .size((s(LABEL_W), s(20)))
             .build(&mut sub_server_label)?;
 
         let mut sub_server_text = nwg::Label::default();
         nwg::Label::builder()
             .parent(&sub_dlg)
             .text("")
-            .position((s(96), s(56)))
-            .size((s(344), s(20)))
+            .position((s(FIELD_X), s(55)))
+            .size((s(FIELD_W), s(20)))
             .build(&mut sub_server_text)?;
 
         let mut sub_link = nwg::Button::default();
         nwg::Button::builder()
             .parent(&sub_dlg)
             .text("使用其他服务器...")
-            .position((s(96), s(82)))
-            .size((s(150), s(26)))
+            .position((s(FIELD_X), s(80)))
+            .size((s(150), s(28)))
             .build(&mut sub_link)?;
 
         let mut sub_server = nwg::TextInput::default();
         nwg::TextInput::builder()
             .parent(&sub_dlg)
-            .position((s(96), s(82)))
-            .size((s(344), s(26)))
+            .position((s(FIELD_X), s(50)))
+            .size((s(FIELD_W), s(ROW_H)))
             .build(&mut sub_server)?;
 
         let mut sub_token_label = nwg::Label::default();
         nwg::Label::builder()
             .parent(&sub_dlg)
             .text("访问令牌:")
-            .position((s(16), s(118)))
-            .size((s(76), s(20)))
+            .position((s(16), s(88)))
+            .size((s(LABEL_W), s(20)))
             .build(&mut sub_token_label)?;
 
         let mut sub_token = nwg::TextInput::default();
         nwg::TextInput::builder()
             .parent(&sub_dlg)
-            .position((s(96), s(115)))
-            .size((s(344), s(26)))
+            .position((s(FIELD_X), s(84)))
+            .size((s(FIELD_W), s(ROW_H)))
             .build(&mut sub_token)?;
 
         let mut sub_cert_label = nwg::Label::default();
         nwg::Label::builder()
             .parent(&sub_dlg)
             .text("客户端证书:")
-            .position((s(16), s(154)))
-            .size((s(76), s(20)))
+            .position((s(16), s(121)))
+            .size((s(LABEL_W), s(20)))
             .build(&mut sub_cert_label)?;
 
         let mut sub_cert_value = nwg::Label::default();
         nwg::Label::builder()
             .parent(&sub_dlg)
             .text("不使用")
-            .position((s(96), s(155)))
+            .position((s(FIELD_X), s(121)))
             .size((s(140), s(20)))
             .build(&mut sub_cert_value)?;
 
@@ -236,31 +345,31 @@ impl Ui {
         nwg::Button::builder()
             .parent(&sub_dlg)
             .text("导入 pfx...")
-            .position((s(240), s(151)))
-            .size((s(112), s(26)))
+            .position((s(246), s(118)))
+            .size((s(110), s(26)))
             .build(&mut sub_import)?;
 
         let mut sub_clear = nwg::Button::default();
         nwg::Button::builder()
             .parent(&sub_dlg)
-            .text("不使用")
-            .position((s(358), s(151)))
-            .size((s(80), s(26)))
+            .text("清除")
+            .position((s(364), s(118)))
+            .size((s(90), s(26)))
             .build(&mut sub_clear)?;
 
         let mut sub_pwd_label = nwg::Label::default();
         nwg::Label::builder()
             .parent(&sub_dlg)
             .text("证书密码:")
-            .position((s(16), s(190)))
-            .size((s(76), s(20)))
+            .position((s(16), s(157)))
+            .size((s(LABEL_W), s(20)))
             .build(&mut sub_pwd_label)?;
 
         let mut sub_pwd = nwg::TextInput::default();
         nwg::TextInput::builder()
             .parent(&sub_dlg)
-            .position((s(96), s(187)))
-            .size((s(220), s(26)))
+            .position((s(FIELD_X), s(154)))
+            .size((s(220), s(ROW_H)))
             .build(&mut sub_pwd)?;
         sub_pwd.set_password_char(Some('*'));
 
@@ -268,16 +377,16 @@ impl Ui {
         nwg::Button::builder()
             .parent(&sub_dlg)
             .text("确定")
-            .position((s(270), s(110)))
-            .size((s(80), s(28)))
+            .position((s(270), s(SUB_BTN_Y_BASIC)))
+            .size((s(BTN_W), s(BTN_H)))
             .build(&mut sub_ok)?;
 
         let mut sub_cancel = nwg::Button::default();
         nwg::Button::builder()
             .parent(&sub_dlg)
             .text("取消")
-            .position((s(358), s(110)))
-            .size((s(80), s(28)))
+            .position((s(364), s(SUB_BTN_Y_BASIC)))
+            .size((s(BTN_W), s(BTN_H)))
             .build(&mut sub_cancel)?;
 
         // ---------------- 设置对话框 ----------------
@@ -285,41 +394,43 @@ impl Ui {
         nwg::Window::builder()
             .parent(Some(&window))
             .flags(nwg::WindowFlags::WINDOW)
-            .size((s(380), s(146)))
+            .size((s(380), s(SET_H)))
             .position((s(560), s(360)))
             .title("设置")
             .build(&mut set_dlg)?;
+        fit_client(&set_dlg, s(380), s(SET_H));
+        center_on(&window, &set_dlg);
 
         let mut set_autostart = nwg::CheckBox::default();
         nwg::CheckBox::builder()
             .parent(&set_dlg)
             .text("开机自启到托盘（登录后静默启动）")
-            .position((s(16), s(30)))
-            .size((s(340), s(22)))
+            .position((s(16), s(26)))
+            .size((s(340), s(24)))
             .build(&mut set_autostart)?;
 
         let mut set_copy = nwg::CheckBox::default();
         nwg::CheckBox::builder()
             .parent(&set_dlg)
             .text("通知内容自动复制到剪贴板")
-            .position((s(16), s(60)))
-            .size((s(340), s(22)))
+            .position((s(16), s(58)))
+            .size((s(340), s(24)))
             .build(&mut set_copy)?;
 
         let mut set_ok = nwg::Button::default();
         nwg::Button::builder()
             .parent(&set_dlg)
             .text("确定")
-            .position((s(198), s(100)))
-            .size((s(80), s(28)))
+            .position((s(190), s(96)))
+            .size((s(BTN_W), s(BTN_H)))
             .build(&mut set_ok)?;
 
         let mut set_cancel = nwg::Button::default();
         nwg::Button::builder()
             .parent(&set_dlg)
             .text("取消")
-            .position((s(284), s(100)))
-            .size((s(80), s(28)))
+            .position((s(284), s(96)))
+            .size((s(BTN_W), s(BTN_H)))
             .build(&mut set_cancel)?;
 
         let ui = Ui {
@@ -354,8 +465,9 @@ impl Ui {
             advanced: Rc::new(Cell::new(false)),
         };
 
-        // 对话框默认是高级态控件全隐藏；初始按非高级态排版
+        // 对话框初始为非高级态；没选中行时「移除」应当是灰的
         ui.advanced_changed(false);
+        ui.btn_remove.set_enabled(false);
 
         let notice = nwg::Notice::create(&ui.window)?;
         let ctx = Ctx {
@@ -390,6 +502,13 @@ impl Ui {
                 ],
             );
         }
+        self.sync_remove_enabled(cfg.subscriptions.len());
+    }
+
+    /// 没有选中行时把「移除」置灰
+    pub fn sync_remove_enabled(&self, count: usize) {
+        let on = matches!(self.list.selected_item(), Some(i) if i < count);
+        self.btn_remove.set_enabled(on);
     }
 
     pub fn selected_sub(&self, cfg: &Config) -> Option<usize> {
@@ -408,8 +527,7 @@ impl Ui {
         } else {
             cfg.last_server.clone()
         };
-        self.sub_server_text
-            .set_text(&format!("{last}（沿用上次的服务器与令牌）"));
+        self.sub_server_text.set_text(&last);
         self.sub_server.set_text(&last);
 
         let cert = cfg.cert_of(&last);
@@ -417,8 +535,8 @@ impl Ui {
         self.set_cert_display(&cert);
 
         self.set_advanced(false);
+        center_on(&self.window, &self.sub_dlg);
         self.sub_dlg.set_visible(true);
-        self.sub_dlg.set_enabled(true);
         self.sub_topic.set_focus();
         self.window.set_enabled(false);
     }
@@ -430,6 +548,7 @@ impl Ui {
     pub fn close_subscribe(&self) {
         self.sub_dlg.set_visible(false);
         self.window.set_enabled(true);
+        self.bring_to_front();
     }
 
     pub fn set_advanced(&self, advanced: bool) {
@@ -452,12 +571,12 @@ impl Ui {
         self.sub_pwd_label.set_visible(advanced);
         self.sub_pwd.set_visible(advanced);
 
-        let height = if advanced { 266 } else { 152 };
-        self.sub_dlg.set_size(px(460), px(height));
+        let h = if advanced { SUB_H_ADVANCED } else { SUB_H_BASIC };
+        fit_client(&self.sub_dlg, px(DLG_W) as i32, px(h) as i32);
 
-        let y = if advanced { 226 } else { 110 };
+        let y = if advanced { SUB_BTN_Y_ADVANCED } else { SUB_BTN_Y_BASIC };
         self.sub_ok.set_position(scale(270), scale(y));
-        self.sub_cancel.set_position(scale(358), scale(y));
+        self.sub_cancel.set_position(scale(364), scale(y));
     }
 
     // ------------------------------------------------------------ 设置对话框
@@ -473,14 +592,25 @@ impl Ui {
         } else {
             nwg::CheckBoxState::Unchecked
         });
+        center_on(&self.window, &self.set_dlg);
         self.set_dlg.set_visible(true);
-        self.set_dlg.set_enabled(true);
         self.window.set_enabled(false);
     }
 
     pub fn close_settings(&self) {
         self.set_dlg.set_visible(false);
         self.window.set_enabled(true);
+        self.bring_to_front();
+    }
+
+    /// 关闭子对话框后把主窗口拉回前台，否则它会掉到别的窗口后面
+    pub fn bring_to_front(&self) {
+        #[cfg(windows)]
+        unsafe {
+            if let Some(h) = raw_hwnd(&self.window) {
+                windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(h);
+            }
+        }
     }
 }
 

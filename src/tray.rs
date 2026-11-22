@@ -5,6 +5,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 pub struct Tray {
     icon: TrayIcon,
+    size: u32,
     pub autostart: CheckMenuItem,
     pub auto_copy: CheckMenuItem,
 }
@@ -37,7 +38,9 @@ impl Tray {
             &quit,
         ]);
 
-        let icon = Icon::from_rgba(bell_rgba(32, COLOR_OK), 32, 32).ok()?;
+        // 直接按任务栏要求的小图标尺寸画，省得 32x32 缩到 20x20 糊掉
+        let size = small_icon_size();
+        let icon = Icon::from_rgba(bell_rgba(size, COLOR_OK), size, size).ok()?;
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -47,13 +50,13 @@ impl Tray {
             .build()
             .ok()?;
 
-        Some(Self { icon: tray, autostart: autostart_item, auto_copy: copy_item })
+        Some(Self { icon: tray, size, autostart: autostart_item, auto_copy: copy_item })
     }
 
     /// 连接状态变化时换图标颜色，并把原因写进 tooltip
     pub fn set_state(&self, connected: bool, tip: &str) {
         let color = if connected { COLOR_OK } else { COLOR_ERR };
-        if let Ok(icon) = Icon::from_rgba(bell_rgba(32, color), 32, 32) {
+        if let Ok(icon) = Icon::from_rgba(bell_rgba(self.size, color), self.size, self.size) {
             let _ = self.icon.set_icon(Some(icon));
         }
         let _ = self.icon.set_tooltip(Some(tip));
@@ -76,26 +79,65 @@ pub fn next_menu_id() -> Option<String> {
 pub const COLOR_OK: [u8; 3] = [0x1f, 0x7a, 0xe0];
 pub const COLOR_ERR: [u8; 3] = [0xe8, 0x38, 0x3d];
 
+/// 任务栏小图标的实际像素尺寸（100% 是 16，125% 是 20）
+fn small_icon_size() -> u32 {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+        let v = GetSystemMetrics(SM_CXSMICON);
+        if v >= 16 {
+            v as u32
+        } else {
+            16
+        }
+    }
+    #[cfg(not(windows))]
+    16
+}
+
 // ---------------------------------------------------------------- 图标绘制
 
-/// 与 tools/make-icon.js 相同的几何，保证托盘图标和 exe 图标是同一个形状
+/// 与 tools/make-icon.js 相同的几何，保证托盘图标和 exe 图标是同一个形状。
+/// 穹顶用椭圆，底部张一圈，铃锤和底沿之间留出空隙 —— 16 像素下也认得出是铃铛。
 fn in_bell(x: f32, y: f32) -> bool {
-    if (0.03..=0.12).contains(&y) && (x - 0.5).abs() < 0.05 {
+    let dx = (x - 0.5).abs();
+
+    // 顶部提手
+    let ky = y - 0.085;
+    if dx * dx + ky * ky < 0.0023 {
         return true;
     }
-    if y > 0.10 && y <= 0.685 {
-        let t = (y - 0.10) / 0.585;
-        let half = 0.085 + 0.335 * t.powf(0.85);
-        if (x - 0.5).abs() < half {
+
+    // 穹顶：以 (0.5, 0.445) 为中心的椭圆上半
+    if y > 0.115 && y <= 0.445 {
+        let t = (y - 0.445) / 0.33;
+        let half = 0.245 * (1.0 - t * t).max(0.0).sqrt();
+        if dx < half {
             return true;
         }
     }
-    if y > 0.685 && y <= 0.765 && (x - 0.5).abs() < 0.425 {
+
+    // 直壁
+    if y > 0.445 && y <= 0.555 && dx < 0.245 {
         return true;
     }
-    let dx = x - 0.5;
-    let dy = y - 0.865;
-    dx * dx + dy * dy < 0.0075
+
+    // 向外张开
+    if y > 0.555 && y <= 0.595 {
+        let t = (y - 0.555) / 0.04;
+        if dx < 0.245 + 0.09 * t {
+            return true;
+        }
+    }
+
+    // 底沿
+    if y > 0.595 && y <= 0.655 && dx < 0.335 {
+        return true;
+    }
+
+    // 铃锤
+    let cy = y - 0.83;
+    dx * dx + cy * cy < 0.0081
 }
 
 fn bell_rgba(size: u32, rgb: [u8; 3]) -> Vec<u8> {

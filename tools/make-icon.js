@@ -4,20 +4,28 @@ const zlib = require('zlib');
 
 // 归一化坐标 (0..1) 判断是否落在铃铛内
 function inBell(x, y) {
-  // 顶部提梁
-  if (y >= 0.03 && y <= 0.12 && Math.abs(x - 0.5) < 0.05) return true;
-  // 钟身
-  if (y > 0.10 && y <= 0.685) {
-    const t = (y - 0.10) / 0.585;
-    const half = 0.085 + 0.335 * Math.pow(t, 0.85);
-    if (Math.abs(x - 0.5) < half) return true;
+  const dx = Math.abs(x - 0.5);
+  // 顶部提手
+  const ky = y - 0.085;
+  if (dx * dx + ky * ky < 0.0023) return true;
+  // 穹顶：以 (0.5, 0.445) 为中心的椭圆上半
+  if (y > 0.115 && y <= 0.445) {
+    const t = (y - 0.445) / 0.33;
+    const half = 0.245 * Math.sqrt(Math.max(0, 1 - t * t));
+    if (dx < half) return true;
+  }
+  // 直壁
+  if (y > 0.445 && y <= 0.555 && dx < 0.245) return true;
+  // 向外张开
+  if (y > 0.555 && y <= 0.595) {
+    const t = (y - 0.555) / 0.04;
+    if (dx < 0.245 + 0.09 * t) return true;
   }
   // 底沿
-  if (y > 0.685 && y <= 0.765 && Math.abs(x - 0.5) < 0.425) return true;
-  // 铃锤
-  const dx = x - 0.5, dy = y - 0.865;
-  if (dx * dx + dy * dy < 0.0075) return true;
-  return false;
+  if (y > 0.595 && y <= 0.655 && dx < 0.335) return true;
+  // 铃锤，和底沿留出空隙，16px 下才能分开
+  const cy = y - 0.83;
+  return dx * dx + cy * cy < 0.0081;
 }
 
 function render(size, rgb, ss = 4) {

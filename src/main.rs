@@ -173,6 +173,9 @@ fn bind_handlers(
 // ---------------------------------------------------------------- 托盘
 
 fn poll_tray(ui: &Rc<Ui>, ctx: &Rc<Ctx>) {
+    // 「移除」只在选中行之后可点，跟着选择状态每 200ms 对一次
+    ui.sync_remove_enabled(ctx.cfg.borrow().subscriptions.len());
+
     while let Some(id) = tray::next_menu_id() {
         match id.as_str() {
             "open" => {
@@ -334,8 +337,15 @@ fn remove_selected(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
 }
 
 fn import_pfx(ui: &Rc<Ui>) {
+    // 顺序很重要：先要密码，再选文件。之前是先要密码后静默 return，
+    // 密码框空着点按钮就什么都不会发生 —— 看起来就是「点了没反应」。
     let password = ui.sub_pwd.text();
     if password.is_empty() {
+        notify::message(
+            "请先在「证书密码」里填好这张 pfx 的密码，再点「导入 pfx...」。\n\
+             pfx 的密码是导出证书时设定的那一个。",
+            "需要证书密码",
+        );
         ui.sub_pwd.set_focus();
         return;
     }
@@ -348,23 +358,30 @@ fn import_pfx(ui: &Rc<Ui>) {
         .build(&mut dialog)
         .is_err()
     {
+        notify::message("无法打开文件选择窗口。", "导入失败");
         return;
     }
 
     if !dialog.run(Some(&ui.sub_dlg)) {
         return;
     }
-    let Ok(path) = dialog.get_selected_item() else {
+    let Ok(item) = dialog.get_selected_item() else {
         return;
     };
-    let path = path.to_string_lossy().to_string();
+    let path = item.to_string_lossy().to_string();
 
     let Ok(bytes) = std::fs::read(&path) else {
+        notify::message(&format!("读不到这个文件：\n{path}"), "导入失败");
         return;
     };
 
     // 先用 native-tls 验一遍：密码错或文件坏了直接拒绝，不要存进去
     if native_tls::Identity::from_pkcs12(&bytes, &password).is_err() {
+        notify::message(
+            "这个 pfx 打不开。可能是密码不对，或者导出时没有勾「包含私钥」。\n\
+             请在 certmgr 里重新导出一次，务必勾上导出私钥。",
+            "导入失败",
+        );
         return;
     }
 
@@ -374,9 +391,12 @@ fn import_pfx(ui: &Rc<Ui>) {
         .unwrap_or("cert")
         .to_string();
 
-    if let Some(id) = config::save_cert(&bytes, &password, &label) {
-        *ui.cert_sel.borrow_mut() = Some(id.clone());
-        ui.set_cert_display(&Some(id));
+    match config::save_cert(&bytes, &password, &label) {
+        Some(id) => {
+            *ui.cert_sel.borrow_mut() = Some(id.clone());
+            ui.set_cert_display(&Some(id));
+        }
+        None => notify::message("证书保存失败：写不进配置目录。", "导入失败"),
     }
 }
 
