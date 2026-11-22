@@ -125,7 +125,6 @@ pub struct Ui {
     pub set_dlg: nwg::Window,
     pub set_autostart: nwg::CheckBox,
     pub set_copy: nwg::CheckBox,
-    pub set_note: nwg::Label,
     pub set_ok: nwg::Button,
     pub set_cancel: nwg::Button,
 
@@ -149,9 +148,10 @@ pub struct Ctx {
 
 // 订阅对话框客户区布局（逻辑像素）
 const DLG_W: i32 = 470;
-const FIELD_X: i32 = 100;
-const FIELD_W: i32 = 354;
-const LABEL_W: i32 = 80;
+// 标签要容得下「访问令牌（选填）:」这样的 8 个全角字，所以比原来宽
+const FIELD_X: i32 = 120;
+const FIELD_W: i32 = 334;
+const LABEL_W: i32 = 104;
 const ROW_H: i32 = 26;
 const BTN_W: i32 = 80;
 const BTN_H: i32 = 28;
@@ -161,7 +161,7 @@ const SUB_H_ADVANCED: i32 = 222;
 const SUB_BTN_Y_BASIC: i32 = 124;
 const SUB_BTN_Y_ADVANCED: i32 = 186;
 
-const SET_H: i32 = 192;
+const SET_H: i32 = 140;
 
 impl Ui {
     pub fn build() -> Result<(Ui, Ctx), nwg::NwgError> {
@@ -327,7 +327,7 @@ impl Ui {
         let mut sub_token_label = nwg::Label::default();
         nwg::Label::builder()
             .parent(&sub_dlg)
-            .text("访问令牌:")
+            .text("访问令牌（选填）:")
             .position((s(16), s(88)))
             .size((s(LABEL_W), s(20)))
             .build(&mut sub_token_label)?;
@@ -342,7 +342,7 @@ impl Ui {
         let mut sub_cert_label = nwg::Label::default();
         nwg::Label::builder()
             .parent(&sub_dlg)
-            .text("证书指纹:")
+            .text("证书指纹（选填）:")
             .position((s(16), s(121)))
             .size((s(LABEL_W), s(20)))
             .build(&mut sub_cert_label)?;
@@ -357,7 +357,7 @@ impl Ui {
         let mut sub_thumb_hint = nwg::Label::default();
         nwg::Label::builder()
             .parent(&sub_dlg)
-            .text("留空则不用客户端证书；证书需装在系统「个人」证书库里")
+            .text("留空表示不用证书；证书需装在系统「个人」里")
             .position((s(FIELD_X), s(150)))
             .size((s(FIELD_W), s(20)))
             .build(&mut sub_thumb_hint)?;
@@ -406,19 +406,11 @@ impl Ui {
             .size((s(340), s(24)))
             .build(&mut set_copy)?;
 
-        let mut set_note = nwg::Label::default();
-        nwg::Label::builder()
-            .parent(&set_dlg)
-            .text("客户端证书从 Windows 证书库读取，订阅时填写证书指纹。")
-            .position((s(16), s(92)))
-            .size((s(348), s(34)))
-            .build(&mut set_note)?;
-
         let mut set_ok = nwg::Button::default();
         nwg::Button::builder()
             .parent(&set_dlg)
             .text("确定")
-            .position((s(190), s(138)))
+            .position((s(190), s(96)))
             .size((s(BTN_W), s(BTN_H)))
             .build(&mut set_ok)?;
 
@@ -426,7 +418,7 @@ impl Ui {
         nwg::Button::builder()
             .parent(&set_dlg)
             .text("取消")
-            .position((s(284), s(138)))
+            .position((s(284), s(96)))
             .size((s(BTN_W), s(BTN_H)))
             .build(&mut set_cancel)?;
 
@@ -453,7 +445,6 @@ impl Ui {
             set_dlg,
             set_autostart,
             set_copy,
-            set_note,
             set_ok,
             set_cancel,
             advanced: Rc::new(Cell::new(false)),

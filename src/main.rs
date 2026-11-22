@@ -115,12 +115,13 @@ fn bind_handlers(ui: &Rc<Ui>, ctx: &Rc<Ctx>) -> Vec<nwg::EventHandler> {
                     } else if handle == ui.btn_remove.handle {
                         remove_selected(&ui, &ctx);
                     } else if handle == ui.sub_link.handle {
-                        let current = ui.sub_server.text();
                         ui.set_advanced(true);
-                        if current.trim().is_empty() {
-                            let last = ctx.cfg.borrow().last_server.clone();
-                            ui.sub_server.set_text(&last);
-                        }
+                        // 「使用其他服务器」就是要换成别的机器，这里必须把
+                        // 沿用上次的服务器/令牌/指纹全部清空，否则一不小心
+                        // 就把令牌发到另一台服务器上了
+                        ui.sub_server.set_text("");
+                        ui.sub_token.set_text("");
+                        ui.sub_thumb.set_text("");
                         ui.sub_server.set_focus();
                     } else if handle == ui.sub_ok.handle {
                         commit_subscribe(&ui, &ctx);
@@ -290,6 +291,19 @@ fn commit_subscribe(ui: &Rc<Ui>, ctx: &Rc<Ctx>) {
     let advanced = ui.advanced.get();
 
     let server = if advanced {
+        // 展开「使用其他服务器」之后地址是空的，空着提交会被 normalize
+        // 兜成 ntfy.sh —— 那等于把消息悄悄订到公共服务器上，必须当场拦住
+        if ui.sub_server.text().trim().is_empty() {
+            notify::message(
+                "服务器地址不能为空。\n\n\
+                 展开「使用其他服务器」后需要填完整地址，例如\n\
+                 https://ntfy.example.com\n\n\
+                 如果只是想用上次那台服务器，取消这次订阅重新点「订阅新主题」即可。",
+                "缺少服务器地址",
+            );
+            ui.sub_server.set_focus();
+            return;
+        }
         normalize_server(&ui.sub_server.text())
     } else {
         let cfg = ctx.cfg.borrow();
