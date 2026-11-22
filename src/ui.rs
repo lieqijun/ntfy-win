@@ -15,6 +15,11 @@ pub fn scale(v: i32) -> i32 {
     (v as f32 * dpi_factor()).round() as i32
 }
 
+/// 尺寸参数用（只接受正数）
+pub fn px(v: i32) -> u32 {
+    scale(v).max(1) as u32
+}
+
 pub fn dpi_factor() -> f32 {
     #[cfg(windows)]
     unsafe {
@@ -29,7 +34,6 @@ pub fn dpi_factor() -> f32 {
     1.0
 }
 
-#[derive(Clone)]
 pub struct Ui {
     pub window: nwg::Window,
     pub list: nwg::ListView,
@@ -73,7 +77,6 @@ pub struct Ctx {
     pub notice: nwg::NoticeSender,
     /// Notice 接收端必须一直活着，否则 notice() 不会触发事件
     pub _notice: nwg::Notice,
-    pub advanced: Rc<Cell<bool>>,
     pub connected: Rc<Cell<bool>>,
     pub tray: RefCell<Option<crate::tray::Tray>>,
     pub tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -96,22 +99,25 @@ impl Ui {
             .parent(&window)
             .position((s(10), s(10)))
             .size((s(444), s(268)))
-            .list_style(
-                nwg::ListViewFlags::REPORT
-                    | nwg::ListViewFlags::SINGLE_SEL
-                    | nwg::ListViewFlags::SHOWSELALWAYS,
+            .list_style(nwg::ListViewStyle::Detailed)
+            .flags(
+                nwg::ListViewFlags::VISIBLE
+                    | nwg::ListViewFlags::TAB_STOP
+                    | nwg::ListViewFlags::SINGLE_SELECTION
+                    | nwg::ListViewFlags::ALWAYS_SHOW_SELECTION,
             )
-            .ex_flags(nwg::ListViewExFlags::FULLROWSELECT)
+            .ex_flags(nwg::ListViewExFlags::FULL_ROW_SELECT)
+            .double_buffer(true)
             .build(&mut list)?;
 
-        list.insert_column(nwg::ListViewColumn {
-            text: "主题".to_string(),
-            width: s(140),
+        list.insert_column(nwg::InsertListViewColumn {
+            text: Some("主题".to_string()),
+            width: Some(s(140)),
             ..Default::default()
         });
-        list.insert_column(nwg::ListViewColumn {
-            text: "服务器".to_string(),
-            width: s(290),
+        list.insert_column(nwg::InsertListViewColumn {
+            text: Some("服务器".to_string()),
+            width: Some(s(290)),
             ..Default::default()
         });
 
@@ -142,7 +148,8 @@ impl Ui {
         // ---------------- 订阅对话框 ----------------
         let mut sub_dlg = nwg::Window::default();
         nwg::Window::builder()
-            .parent(&window)
+            .parent(Some(&window))
+            .flags(nwg::WindowFlags::WINDOW)
             .size((s(460), s(152)))
             .position((s(520), s(320)))
             .title("订阅新主题")
@@ -193,7 +200,6 @@ impl Ui {
             .position((s(96), s(82)))
             .size((s(344), s(26)))
             .build(&mut sub_server)?;
-        sub_server.set_visible(false);
 
         let mut sub_token_label = nwg::Label::default();
         nwg::Label::builder()
@@ -223,7 +229,7 @@ impl Ui {
             .parent(&sub_dlg)
             .text("不使用")
             .position((s(96), s(155)))
-            .size((s(146), s(20)))
+            .size((s(140), s(20)))
             .build(&mut sub_cert_value)?;
 
         let mut sub_import = nwg::Button::default();
@@ -256,6 +262,7 @@ impl Ui {
             .position((s(96), s(187)))
             .size((s(220), s(26)))
             .build(&mut sub_pwd)?;
+        sub_pwd.set_password_char(Some('*'));
 
         let mut sub_ok = nwg::Button::default();
         nwg::Button::builder()
@@ -276,7 +283,8 @@ impl Ui {
         // ---------------- 设置对话框 ----------------
         let mut set_dlg = nwg::Window::default();
         nwg::Window::builder()
-            .parent(&window)
+            .parent(Some(&window))
+            .flags(nwg::WindowFlags::WINDOW)
             .size((s(380), s(146)))
             .position((s(560), s(360)))
             .title("设置")
@@ -346,11 +354,14 @@ impl Ui {
             advanced: Rc::new(Cell::new(false)),
         };
 
-        let (notice_sender, notice) = nwg::Notice::new(&window);
+        // 对话框默认是高级态控件全隐藏；初始按非高级态排版
+        ui.advanced_changed(false);
+
+        let notice = nwg::Notice::create(&ui.window)?;
         let ctx = Ctx {
             cfg: Rc::new(RefCell::new(Config::load())),
             events: Arc::new(Mutex::new(VecDeque::new())),
-            notice: notice_sender,
+            notice: notice.sender(),
             _notice: notice,
             connected: Rc::new(Cell::new(false)),
             tray: RefCell::new(None),
@@ -364,13 +375,20 @@ impl Ui {
 
     pub fn refresh_list(&self, cfg: &Config) {
         self.list.clear();
-        for (i, sub) in cfg.subscriptions.iter().enumerate() {
-            let item = nwg::ListViewItem {
-                text: sub.topic.clone(),
-                subtext: vec![sub.server.clone()],
-                ..Default::default()
-            };
-            let _ = self.list.insert_item(item, i);
+        for sub in &cfg.subscriptions {
+            self.list.insert_items_row(
+                None,
+                &[
+                    nwg::InsertListViewItem {
+                        text: Some(sub.topic.clone()),
+                        ..Default::default()
+                    },
+                    nwg::InsertListViewItem {
+                        text: Some(sub.server.clone()),
+                        ..Default::default()
+                    },
+                ],
+            );
         }
     }
 
@@ -383,6 +401,7 @@ impl Ui {
     pub fn open_subscribe(&self, cfg: &Config) {
         self.sub_topic.set_text("");
         self.sub_pwd.set_text("");
+        self.sub_token.set_text("");
 
         let last = if cfg.last_server.is_empty() {
             "https://ntfy.sh".to_string()
@@ -392,7 +411,6 @@ impl Ui {
         self.sub_server_text
             .set_text(&format!("{last}（沿用上次的服务器与令牌）"));
         self.sub_server.set_text(&last);
-        self.sub_token.set_text("");
 
         let cert = cfg.cert_of(&last);
         *self.cert_sel.borrow_mut() = cert.clone();
@@ -420,6 +438,7 @@ impl Ui {
 
     fn advanced_changed(&self, advanced: bool) {
         self.advanced.set(advanced);
+
         self.sub_server_text.set_visible(!advanced);
         self.sub_link.set_visible(!advanced);
 
@@ -433,29 +452,29 @@ impl Ui {
         self.sub_pwd_label.set_visible(advanced);
         self.sub_pwd.set_visible(advanced);
 
-        let height = if advanced { scale(266) } else { scale(152) };
-        self.sub_dlg.set_size(scale(460), height);
+        let height = if advanced { 266 } else { 152 };
+        self.sub_dlg.set_size(px(460), px(height));
 
-        let y = if advanced { scale(226) } else { scale(110) };
-        self.sub_ok.set_position(scale(270), y);
-        self.sub_cancel.set_position(scale(358), y);
+        let y = if advanced { 226 } else { 110 };
+        self.sub_ok.set_position(scale(270), scale(y));
+        self.sub_cancel.set_position(scale(358), scale(y));
     }
 
     // ------------------------------------------------------------ 设置对话框
 
     pub fn open_settings(&self, cfg: &Config) {
-        self.set_autostart
-            .set_check_state(if cfg.settings.autostart {
-                nwg::CheckBoxState::Checked
-            } else {
-                nwg::CheckBoxState::Unchecked
-            });
+        self.set_autostart.set_check_state(if cfg.settings.autostart {
+            nwg::CheckBoxState::Checked
+        } else {
+            nwg::CheckBoxState::Unchecked
+        });
         self.set_copy.set_check_state(if cfg.settings.auto_copy {
             nwg::CheckBoxState::Checked
         } else {
             nwg::CheckBoxState::Unchecked
         });
         self.set_dlg.set_visible(true);
+        self.set_dlg.set_enabled(true);
         self.window.set_enabled(false);
     }
 

@@ -7,6 +7,7 @@ mod tray;
 mod ui;
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use native_windows_gui as nwg;
 
@@ -15,7 +16,7 @@ use net::{ConnState, NetEvent};
 use ui::{Ctx, Ui};
 
 fn main() {
-    if !nwg::init() {
+    if nwg::init().is_err() {
         return;
     }
     if !acquire_single_instance() {
@@ -28,11 +29,15 @@ fn main() {
         Ok(v) => v,
         Err(_) => return,
     };
+    let ui = Rc::new(ui);
     let ctx = Rc::new(ctx);
 
     {
-        let cfg = ctx.cfg.borrow();
-        *ctx.tray.borrow_mut() = tray::Tray::new(cfg.settings.autostart, cfg.settings.auto_copy);
+        let (autostart, auto_copy) = {
+            let cfg = ctx.cfg.borrow();
+            (cfg.settings.autostart, cfg.settings.auto_copy)
+        };
+        *ctx.tray.borrow_mut() = tray::Tray::new(autostart, auto_copy);
     }
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -47,21 +52,24 @@ fn main() {
     ui.refresh_list(&ctx.cfg.borrow());
     restart_network(&ctx, rt.handle());
 
-    let mut timer = nwg::Timer::default();
-    let _ = nwg::Timer::builder()
+    let mut timer = nwg::AnimationTimer::default();
+    let _ = nwg::AnimationTimer::builder()
         .parent(&ui.window)
-        .interval(250)
+        .interval(Duration::from_millis(200))
         .active(true)
         .build(&mut timer);
 
-    let _handlers = bind_handlers(&ui, ctx.clone(), rt.handle().clone());
+    let handlers = bind_handlers(&ui, &ctx, rt.handle().clone());
 
+    // --silent 用于开机自启：只在托盘，不弹窗口
     let silent = std::env::args().any(|a| a == "--silent");
-    if !silent && ctx.cfg.borrow().subscriptions.is_empty() {
-        ui.window.set_visible(true);
-    }
+    ui.window.set_visible(!silent);
 
     nwg::dispatch_thread_events();
+
+    for h in &handlers {
+        nwg::unbind_event_handler(h);
+    }
     drop(timer);
 }
 
@@ -86,7 +94,11 @@ fn acquire_single_instance() -> bool {
 
 // ---------------------------------------------------------------- 事件
 
-fn bind_handlers(ui: &Ui, ctx: Rc<Ctx>, rt: tokio::runtime::Handle) -> Vec<nwg::EventHandler> {
+fn bind_handlers(
+    ui: &Rc<Ui>,
+    ctx: &Rc<Ctx>,
+    rt: tokio::runtime::Handle,
+) -> Vec<nwg::EventHandler> {
     let mut handlers = Vec::new();
     let targets = [ui.window.handle, ui.sub_dlg.handle, ui.set_dlg.handle];
 
@@ -95,19 +107,24 @@ fn bind_handlers(ui: &Ui, ctx: Rc<Ctx>, rt: tokio::runtime::Handle) -> Vec<nwg::
         let ctx = ctx.clone();
         let rt = rt.clone();
 
-        let handler = nwg::full_bind_event_handler(&hwnd, move |evt, _data, handle| {
+        let handler = nwg::full_bind_event_handler(&hwnd, move |evt, data, handle| {
             match evt {
                 nwg::Event::OnButtonClick => {
                     if handle == ui.btn_add.handle {
-                        ui.open_subscribe(&ctx.cfg.borrow());
+                        let cfg = ctx.cfg.borrow();
+                        ui.open_subscribe(&cfg);
                     } else if handle == ui.btn_settings.handle {
-                        ui.open_settings(&ctx.cfg.borrow());
+                        let cfg = ctx.cfg.borrow();
+                        ui.open_settings(&cfg);
                     } else if handle == ui.btn_remove.handle {
                         remove_selected(&ui, &ctx, &rt);
                     } else if handle == ui.sub_link.handle {
                         let current = ui.sub_server.text();
                         ui.set_advanced(true);
-                        ui.sub_server.set_text(&current);
+                        if current.trim().is_empty() {
+                            let last = ctx.cfg.borrow().last_server.clone();
+                            ui.sub_server.set_text(&last);
+                        }
                         ui.sub_server.set_focus();
                     } else if handle == ui.sub_import.handle {
                         import_pfx(&ui);
@@ -125,8 +142,11 @@ fn bind_handlers(ui: &Ui, ctx: Rc<Ctx>, rt: tokio::runtime::Handle) -> Vec<nwg::
                     }
                 }
                 nwg::Event::OnWindowClose => {
+                    // 托盘程序：关闭一律只是隐藏，绝不销毁窗口
+                    if let nwg::EventData::OnWindowClose(info) = data {
+                        info.close(false);
+                    }
                     if handle == ui.window.handle {
-                        // 关闭只是隐藏，进程继续守在托盘
                         ui.window.set_visible(false);
                     } else if handle == ui.sub_dlg.handle {
                         ui.close_subscribe();
@@ -136,7 +156,6 @@ fn bind_handlers(ui: &Ui, ctx: Rc<Ctx>, rt: tokio::runtime::Handle) -> Vec<nwg::
                 }
                 nwg::Event::OnTimerTick => {
                     poll_tray(&ui, &ctx);
-                    drain_events(&ctx);
                 }
                 nwg::Event::OnNotice => {
                     drain_events(&ctx);
@@ -145,9 +164,7 @@ fn bind_handlers(ui: &Ui, ctx: Rc<Ctx>, rt: tokio::runtime::Handle) -> Vec<nwg::
             }
         });
 
-        if let Some(h) = handler {
-            handlers.push(h);
-        }
+        handlers.push(handler);
     }
 
     handlers
@@ -155,48 +172,55 @@ fn bind_handlers(ui: &Ui, ctx: Rc<Ctx>, rt: tokio::runtime::Handle) -> Vec<nwg::
 
 // ---------------------------------------------------------------- 托盘
 
-fn poll_tray(ui: &Ui, ctx: &Ctx) {
-    while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-        let Some(tray) = ctx.tray.borrow().as_ref() else {
-            continue;
-        };
-        let id = event.id();
-
-        if id == tray.open.id() {
-            ui.window.set_visible(true);
-            ui.window.set_focus();
-        } else if id == tray.add.id() {
-            ui.window.set_visible(true);
-            ui.open_subscribe(&ctx.cfg.borrow());
-        } else if id == tray.settings.id() {
-            ui.window.set_visible(true);
-            ui.open_settings(&ctx.cfg.borrow());
-        } else if id == tray.autostart.id() {
-            let value = !ctx.cfg.borrow().settings.autostart;
-            {
-                let mut cfg = ctx.cfg.borrow_mut();
-                cfg.settings.autostart = value;
-                let _ = cfg.save();
+fn poll_tray(ui: &Rc<Ui>, ctx: &Rc<Ctx>) {
+    while let Some(id) = tray::next_menu_id() {
+        match id.as_str() {
+            "open" => {
+                ui.window.set_visible(true);
+                ui.window.set_focus();
             }
-            config::set_autostart(value);
-            tray.autostart.set_checked(value);
-        } else if id == tray.auto_copy.id() {
-            let value = !ctx.cfg.borrow().settings.auto_copy;
-            {
-                let mut cfg = ctx.cfg.borrow_mut();
-                cfg.settings.auto_copy = value;
-                let _ = cfg.save();
+            "add" => {
+                ui.window.set_visible(true);
+                let cfg = ctx.cfg.borrow();
+                ui.open_subscribe(&cfg);
             }
-            tray.auto_copy.set_checked(value);
-        } else if id == tray.quit.id() {
-            std::process::exit(0);
+            "settings" => {
+                ui.window.set_visible(true);
+                let cfg = ctx.cfg.borrow();
+                ui.open_settings(&cfg);
+            }
+            "autostart" => {
+                let value = !ctx.cfg.borrow().settings.autostart;
+                {
+                    let mut cfg = ctx.cfg.borrow_mut();
+                    cfg.settings.autostart = value;
+                    let _ = cfg.save();
+                }
+                config::set_autostart(value);
+                if let Some(tray) = ctx.tray.borrow().as_ref() {
+                    tray.autostart.set_checked(value);
+                }
+            }
+            "auto_copy" => {
+                let value = !ctx.cfg.borrow().settings.auto_copy;
+                {
+                    let mut cfg = ctx.cfg.borrow_mut();
+                    cfg.settings.auto_copy = value;
+                    let _ = cfg.save();
+                }
+                if let Some(tray) = ctx.tray.borrow().as_ref() {
+                    tray.auto_copy.set_checked(value);
+                }
+            }
+            "quit" => std::process::exit(0),
+            _ => {}
         }
     }
 }
 
 // ---------------------------------------------------------------- 网络事件
 
-fn drain_events(ctx: &Ctx) {
+fn drain_events(ctx: &Rc<Ctx>) {
     let queued: Vec<NetEvent> = {
         let mut queue = ctx.events.lock().unwrap();
         queue.drain(..).collect()
@@ -212,14 +236,15 @@ fn drain_events(ctx: &Ctx) {
             }
             NetEvent::State { state, .. } => {
                 let connected = state == ConnState::Connected;
-                ctx.connected.set(connected);
                 let tip = match state {
                     ConnState::Connected => "ntfy · 已连接",
                     ConnState::Disconnected => "ntfy · 连接断开，正在重连",
                     ConnState::AuthFailed => "ntfy · 认证失败，请检查令牌或证书",
                 };
-                if let Some(tray) = ctx.tray.borrow().as_ref() {
-                    tray.set_state(connected, tip);
+                if ctx.connected.replace(connected) != connected || !connected {
+                    if let Some(tray) = ctx.tray.borrow().as_ref() {
+                        tray.set_state(connected, tip);
+                    }
                 }
             }
         }
@@ -228,7 +253,7 @@ fn drain_events(ctx: &Ctx) {
 
 // ---------------------------------------------------------------- 订阅
 
-fn commit_subscribe(ui: &Ui, ctx: &Ctx, rt: &tokio::runtime::Handle) {
+fn commit_subscribe(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
     let topic = ui
         .sub_topic
         .text()
@@ -267,6 +292,8 @@ fn commit_subscribe(ui: &Ui, ctx: &Ctx, rt: &tokio::runtime::Handle) {
             let token = ui.sub_token.text();
             cfg.set_token(&server, &token);
             cfg.set_cert(&server, cert);
+        } else if !cfg.servers.contains_key(&server) {
+            cfg.servers.entry(server.clone()).or_default();
         }
 
         let exists = cfg
@@ -274,8 +301,7 @@ fn commit_subscribe(ui: &Ui, ctx: &Ctx, rt: &tokio::runtime::Handle) {
             .iter()
             .any(|s| s.topic == topic && s.server == server);
         if !exists {
-            cfg.subscriptions
-                .push(Sub { topic: topic.clone(), server: server.clone() });
+            cfg.subscriptions.push(Sub { topic: topic.clone(), server: server.clone() });
         }
         cfg.last_server = server.clone();
         let _ = cfg.save();
@@ -286,7 +312,7 @@ fn commit_subscribe(ui: &Ui, ctx: &Ctx, rt: &tokio::runtime::Handle) {
     restart_network(ctx, rt);
 }
 
-fn remove_selected(ui: &Ui, ctx: &Ctx, rt: &tokio::runtime::Handle) {
+fn remove_selected(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
     let index = {
         let cfg = ctx.cfg.borrow();
         match ui.selected_sub(&cfg) {
@@ -307,29 +333,31 @@ fn remove_selected(ui: &Ui, ctx: &Ctx, rt: &tokio::runtime::Handle) {
     restart_network(ctx, rt);
 }
 
-fn import_pfx(ui: &Ui) {
+fn import_pfx(ui: &Rc<Ui>) {
     let password = ui.sub_pwd.text();
     if password.is_empty() {
         ui.sub_pwd.set_focus();
         return;
     }
 
-    let dialog = match nwg::FileDialog::builder()
+    let mut dialog = nwg::FileDialog::default();
+    if nwg::FileDialog::builder()
         .title("选择客户端证书（.pfx / .p12）")
         .action(nwg::FileDialogAction::Open)
         .filters("PKCS#12(*.pfx;*.p12)|*.pfx;*.p12")
-        .build()
+        .build(&mut dialog)
+        .is_err()
     {
-        Ok(d) => d,
-        Err(_) => return,
-    };
+        return;
+    }
 
     if !dialog.run(Some(&ui.sub_dlg)) {
         return;
     }
-    let Some(path) = dialog.get_selected_item() else {
+    let Ok(path) = dialog.get_selected_item() else {
         return;
     };
+    let path = path.to_string_lossy().to_string();
 
     let Ok(bytes) = std::fs::read(&path) else {
         return;
@@ -352,7 +380,7 @@ fn import_pfx(ui: &Ui) {
     }
 }
 
-fn commit_settings(ui: &Ui, ctx: &Ctx) {
+fn commit_settings(ui: &Rc<Ui>, ctx: &Rc<Ctx>) {
     let autostart = ui.set_autostart.check_state() == nwg::CheckBoxState::Checked;
     let auto_copy = ui.set_copy.check_state() == nwg::CheckBoxState::Checked;
 
@@ -365,15 +393,14 @@ fn commit_settings(ui: &Ui, ctx: &Ctx) {
 
     config::set_autostart(autostart);
     if let Some(tray) = ctx.tray.borrow().as_ref() {
-        tray.autostart.set_checked(autostart);
-        tray.auto_copy.set_checked(auto_copy);
+        tray.set_checked(autostart, auto_copy);
     }
     ui.close_settings();
 }
 
 // ---------------------------------------------------------------- 连接调度
 
-fn restart_network(ctx: &Ctx, rt: &tokio::runtime::Handle) {
+fn restart_network(ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
     {
         let mut tasks = ctx.tasks.lock().unwrap();
         for task in tasks.drain(..) {
@@ -408,9 +435,9 @@ fn restart_network(ctx: &Ctx, rt: &tokio::runtime::Handle) {
     }
 }
 
-fn make_sink(ctx: &Ctx) -> net::Sink {
+fn make_sink(ctx: &Rc<Ctx>) -> net::Sink {
     let events = ctx.events.clone();
-    let notice = ctx.notice.clone();
+    let notice = ctx.notice;
     std::sync::Arc::new(move |event: NetEvent| {
         events.lock().unwrap().push_back(event);
         notice.notice();

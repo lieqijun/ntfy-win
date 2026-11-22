@@ -1,33 +1,29 @@
 //! 托盘图标与右键菜单。
 
-use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 pub struct Tray {
     icon: TrayIcon,
-    pub open: MenuItem,
-    pub add: MenuItem,
     pub autostart: CheckMenuItem,
     pub auto_copy: CheckMenuItem,
-    pub settings: MenuItem,
-    pub quit: MenuItem,
 }
 
 impl Tray {
     pub fn new(autostart: bool, auto_copy: bool) -> Option<Self> {
         let menu = Menu::new();
 
-        let open = MenuItem::with_id("open", "打开主窗口", true, None).ok()?;
-        let add = MenuItem::with_id("add", "订阅新主题...", true, None).ok()?;
-        let sep1 = PredefinedMenuItem::separator().ok()?;
+        let open = MenuItem::with_id("open", "打开主窗口", true, None);
+        let add = MenuItem::with_id("add", "订阅新主题...", true, None);
+        let sep1 = PredefinedMenuItem::separator();
         let autostart_item =
-            CheckMenuItem::with_id("autostart", "开机自启", true, autostart, None).ok()?;
+            CheckMenuItem::with_id("autostart", "开机自启", true, autostart, None);
         let copy_item =
-            CheckMenuItem::with_id("auto_copy", "自动复制通知内容", true, auto_copy, None).ok()?;
-        let sep2 = PredefinedMenuItem::separator().ok()?;
-        let settings = MenuItem::with_id("settings", "设置...", true, None).ok()?;
-        let sep3 = PredefinedMenuItem::separator().ok()?;
-        let quit = MenuItem::with_id("quit", "退出", true, None).ok()?;
+            CheckMenuItem::with_id("auto_copy", "自动复制通知内容", true, auto_copy, None);
+        let sep2 = PredefinedMenuItem::separator();
+        let settings = MenuItem::with_id("settings", "设置...", true, None);
+        let sep3 = PredefinedMenuItem::separator();
+        let quit = MenuItem::with_id("quit", "退出", true, None);
 
         let _ = menu.append_items(&[
             &open,
@@ -51,24 +47,29 @@ impl Tray {
             .build()
             .ok()?;
 
-        Some(Self {
-            icon: tray,
-            open,
-            add,
-            autostart: autostart_item,
-            auto_copy: copy_item,
-            settings,
-            quit,
-        })
+        Some(Self { icon: tray, autostart: autostart_item, auto_copy: copy_item })
     }
 
-    /// 断开时把图标换成红色，并把原因写进 tooltip
+    /// 连接状态变化时换图标颜色，并把原因写进 tooltip
     pub fn set_state(&self, connected: bool, tip: &str) {
         let color = if connected { COLOR_OK } else { COLOR_ERR };
         if let Ok(icon) = Icon::from_rgba(bell_rgba(32, color), 32, 32) {
             let _ = self.icon.set_icon(Some(icon));
         }
         let _ = self.icon.set_tooltip(Some(tip));
+    }
+
+    pub fn set_checked(&self, autostart: bool, auto_copy: bool) {
+        self.autostart.set_checked(autostart);
+        self.auto_copy.set_checked(auto_copy);
+    }
+}
+
+/// 取出菜单事件里的 id。窗口被隐藏时也照常收到。
+pub fn next_menu_id() -> Option<String> {
+    match MenuEvent::receiver().try_recv() {
+        Ok(event) => Some(event.id.0.clone()),
+        Err(_) => None,
     }
 }
 

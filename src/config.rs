@@ -307,7 +307,7 @@ pub fn list_certs() -> Vec<CertInfo> {
 #[cfg(windows)]
 pub fn set_autostart(enable: bool) {
     use windows_sys::Win32::System::Registry::{
-        RegDeleteValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
+        RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
     };
 
     let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -326,7 +326,7 @@ pub fn set_autostart(enable: bool) {
                 (cmd.len() * 2) as u32,
             );
         } else {
-            let _ = RegDeleteValueW(HKEY_CURRENT_USER, sub.as_ptr(), name.as_ptr());
+            RegDeleteKeyValueW(HKEY_CURRENT_USER, sub.as_ptr(), name.as_ptr());
         }
     }
 }
