@@ -15,6 +15,20 @@ use config::Sub;
 use net::{ConnState, NetEvent};
 use ui::{Ctx, Ui};
 
+/// 失败原因只弹一次框，免得退避重连时每 60 秒糊一个对话框在脸上
+static FAIL_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 托盘 tooltip 整个只有 128 个字符，取失败原因的第一行再截断
+fn brief(detail: &str) -> String {
+    let line = detail.lines().next().unwrap_or("").trim();
+    let count = line.chars().count();
+    let mut out: String = line.chars().take(48).collect();
+    if count > 48 {
+        out.push('…');
+    }
+    out
+}
+
 fn main() {
     if nwg::init().is_err() {
         return;
@@ -237,16 +251,38 @@ fn drain_events(ctx: &Rc<Ctx>) {
                     notify::copy_to_clipboard(&body);
                 }
             }
-            NetEvent::State { state, .. } => {
+            NetEvent::State { state, detail, .. } => {
                 let connected = state == ConnState::Connected;
                 let tip = match state {
-                    ConnState::Connected => "ntfy · 已连接",
-                    ConnState::Disconnected => "ntfy · 连接断开，正在重连",
-                    ConnState::AuthFailed => "ntfy · 认证失败，请检查令牌或证书",
+                    ConnState::Connected => "ntfy · 已连接".to_string(),
+                    ConnState::Disconnected => {
+                        format!("ntfy · 重连中：{}", brief(&detail))
+                    }
+                    ConnState::AuthFailed => {
+                        format!("ntfy · 认证失败：{}", brief(&detail))
+                    }
                 };
                 if ctx.connected.replace(connected) != connected || !connected {
                     if let Some(tray) = ctx.tray.borrow().as_ref() {
-                        tray.set_state(connected, tip);
+                        tray.set_state(connected, &tip);
+                    }
+                }
+
+                // 连不上时只弹一次框，把完整原因摊开给人看。
+                // 之后靠托盘 tooltip，不重复打扰。
+                if state != ConnState::Connected && !detail.is_empty() {
+                    if !FAIL_REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        notify::message(
+                            &format!(
+                                "{detail}\n\n\
+                                 这条提示只显示一次。之后把鼠标移到托盘图标上，\n\
+                                 就能看到当前的失败原因。"
+                            ),
+                            match state {
+                                ConnState::AuthFailed => "无法连接（认证或端点错误）",
+                                _ => "无法连接，正在重试",
+                            },
+                        );
                     }
                 }
             }
@@ -377,11 +413,26 @@ fn import_pfx(ui: &Rc<Ui>) {
         return;
     };
 
-    // 先用 native-tls 验一遍：密码错或文件坏了直接拒绝，不要存进去
-    if native_tls::Identity::from_pkcs12(&bytes, &password).is_err() {
+    // 先用 native-tls 验一遍：密码错或文件坏了直接拒绝，不要存进去。
+    // 这里把底层错误原样带出来 —— Windows 上最终调的是 crypt32 的
+    // PFXImportCertStore，错误码能区分「密码错」「不含私钥」「格式不认识」，
+    // 不给出来就只能是「打不开」这种没用的提示。
+    if let Err(e) = native_tls::Identity::from_pkcs12(&bytes, &password) {
+        let detail = format!("{e}");
+        let hint = if detail.contains("0x80070056") || detail.to_lowercase().contains("password") {
+            "密码不对。"
+        } else if detail.contains("0x8009310b") || detail.contains("0x80093102") {
+            "Windows 认不出这个 pfx 的编码格式，重新导出一次试试。"
+        } else {
+            "可能是密码不对，或者导出时没有勾「包含私钥」。"
+        };
         notify::message(
-            "这个 pfx 打不开。可能是密码不对，或者导出时没有勾「包含私钥」。\n\
-             请在 certmgr 里重新导出一次，务必勾上导出私钥。",
+            &format!(
+                "这个 pfx 打不开。{hint}\n\n\
+                 请在 certmgr 里重新导出一次，务必勾上「包含私钥」，\n\
+                 加密方式选「AES-256-SHA256」或「TripleDES-SHA1」都可以。\n\n\
+                 原始错误：{detail}"
+            ),
             "导入失败",
         );
         return;
@@ -429,6 +480,8 @@ fn restart_network(ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
             task.abort();
         }
     }
+    // 配置改了就要重新给一次提示的机会
+    FAIL_REPORTED.store(false, std::sync::atomic::Ordering::SeqCst);
 
     let mut by_server: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     {
@@ -442,15 +495,46 @@ fn restart_network(ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
     }
 
     for (server, topics) in by_server {
-        let (token, identity) = {
+        let (token, identity, cert_err) = {
             let cfg = ctx.cfg.borrow();
             let token = cfg.token(&server);
-            let identity = cfg.cert_of(&server).and_then(|id| {
-                let (pfx, pwd) = config::load_cert(&id)?;
-                native_tls::Identity::from_pkcs12(&pfx, &pwd).ok()
-            });
-            (token, identity)
+            let mut err = None;
+            let identity = match cfg.cert_of(&server) {
+                Some(id) => match config::load_cert(&id) {
+                    Some((pfx, pwd)) => match native_tls::Identity::from_pkcs12(&pfx, &pwd) {
+                        Ok(id) => Some(id),
+                        Err(e) => {
+                            err = Some(format!(
+                                "{server} 的客户端证书加载失败：{e}\n\
+                                 证书文件或密码可能坏了，请重新导入一次 pfx。"
+                            ));
+                            None
+                        }
+                    },
+                    None => {
+                        err = Some(format!(
+                            "{server} 的客户端证书文件读不出来（DPAPI 解密失败或文件被删）。\n\
+                             请到订阅窗口重新导入 pfx。"
+                        ));
+                        None
+                    }
+                },
+                None => None,
+            };
+            (token, identity, err)
         };
+
+        // 证书都没加载上就别连了，连上去也只会得到 403，
+        // 那样还得去猜是令牌错还是证书错
+        if let Some(detail) = cert_err {
+            ctx.events.lock().unwrap().push_back(NetEvent::State {
+                server,
+                state: ConnState::AuthFailed,
+                detail,
+            });
+            ctx.notice.notice();
+            continue;
+        }
 
         let task = net::spawn_server(rt, server, token, topics, identity, make_sink(ctx));
         ctx.tasks.lock().unwrap().push(task);

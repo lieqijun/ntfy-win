@@ -204,6 +204,11 @@ impl Ui {
             .double_buffer(true)
             .build(&mut list)?;
 
+        // nwg 的 ListView::forced_flags() 里硬编码了 LVS_NOCOLUMNHEADER
+        // （源码 controls/list_view.rs:989），建窗口时会 OR 进真实样式，
+        // 所以 Detailed 模式下列头永远不出现。必须显式把它去掉。
+        list.set_headers_enabled(true);
+
         list.insert_column(nwg::InsertListViewColumn {
             text: Some("主题".to_string()),
             width: Some(s(150)),
@@ -215,15 +220,22 @@ impl Ui {
             ..Default::default()
         });
 
-        // nwg 没有给 ListView 留 set_font，只能自己发一次 WM_SETFONT，
-        // 否则列表行和表头还是宋体，跟下面那几个雅黑按钮不是一个风格
+        // nwg 没有给 ListView 留 set_font，只能自己发 WM_SETFONT，
+        // 否则列表行和表头还是宋体，跟下面那几个雅黑按钮不是一个风格。
+        // 列头是 ListView 内部的 header 子控件，字体不会自动跟着继承，
+        // 要单独拿 LVM_GETHEADER 取到它的 HWND 再设一次。
         #[cfg(windows)]
         if !font_handle.is_null() {
             if let Some(h) = raw_handle(&list.handle) {
                 unsafe {
                     use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
                     const WM_SETFONT: u32 = 0x0030;
+                    const LVM_GETHEADER: u32 = 0x1000 + 31;
                     SendMessageW(h, WM_SETFONT, font_handle as usize, 1);
+                    let header = SendMessageW(h, LVM_GETHEADER, 0, 0) as *mut core::ffi::c_void;
+                    if !header.is_null() {
+                        SendMessageW(header, WM_SETFONT, font_handle as usize, 1);
+                    }
                 }
             }
         }
