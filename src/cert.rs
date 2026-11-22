@@ -3,7 +3,8 @@
 //! 私钥始终留在证书库里：程序只是拿到一个只读句柄交给 SChannel，
 //! 既不导出私钥，也不经手 pfx 密码。所以这里没有「导入」「删除」这类操作。
 
-use schannel::cert_context::{CertContext, CertStore, HashAlgorithm};
+use schannel::cert_context::{CertContext, HashAlgorithm};
+use schannel::cert_store::CertStore;
 use schannel::schannel_cred::{Builder as CredBuilder, Direction, SchannelCred};
 
 /// 规范化用户输入的指纹：忽略空格、冒号、连字符，统一大写。
