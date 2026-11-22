@@ -109,7 +109,12 @@ fn bind_handlers(
     rt: tokio::runtime::Handle,
 ) -> Vec<nwg::EventHandler> {
     let mut handlers = Vec::new();
-    let targets = [ui.window.handle, ui.sub_dlg.handle, ui.set_dlg.handle];
+    let targets = [
+        ui.window.handle,
+        ui.sub_dlg.handle,
+        ui.set_dlg.handle,
+        ui.pwd_dlg.handle,
+    ];
 
     for hwnd in targets {
         let ui = ui.clone();
@@ -148,13 +153,19 @@ fn bind_handlers(
                         commit_settings(&ui, &ctx);
                     } else if handle == ui.set_cancel.handle {
                         ui.close_settings();
+                    } else if handle == ui.set_cert_rep.handle {
+                        replace_selected_cert(&ui, &ctx, &rt);
                     } else if handle == ui.set_cert_del.handle {
                         delete_selected_cert(&ui, &ctx, &rt);
+                    } else if handle == ui.pwd_ok.handle {
+                        ui.finish_password(true);
+                    } else if handle == ui.pwd_cancel.handle {
+                        ui.finish_password(false);
                     }
                 }
                 nwg::Event::OnListBoxSelect => {
                     if handle == ui.set_cert_list.handle {
-                        ui.sync_cert_del();
+                        ui.sync_cert_buttons();
                     }
                 }
                 nwg::Event::OnWindowClose => {
@@ -168,6 +179,9 @@ fn bind_handlers(
                         ui.close_subscribe();
                     } else if handle == ui.set_dlg.handle {
                         ui.close_settings();
+                    } else if handle == ui.pwd_dlg.handle {
+                        // 点 X 等于取消：结束模态循环，窗口由 ask_password 收尾
+                        ui.finish_password(false);
                     }
                 }
                 nwg::Event::OnTimerTick => {
@@ -191,6 +205,11 @@ fn bind_handlers(
 fn poll_tray(ui: &Rc<Ui>, ctx: &Rc<Ctx>) {
     // 「移除」只在选中行之后可点，跟着选择状态每 200ms 对一次
     ui.sync_remove_enabled(ctx.cfg.borrow().subscriptions.len());
+
+    // 密码框是模态的：这期间不理托盘点击，免得主窗口翻上来盖住它
+    if ui.pwd_dlg.visible() {
+        return;
+    }
 
     // 左键单击托盘图标 = 打开主窗口
     if tray::left_clicked() {
@@ -378,20 +397,10 @@ fn remove_selected(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
     restart_network(ctx, rt);
 }
 
-fn import_pfx(ui: &Rc<Ui>) {
-    // 顺序很重要：先要密码，再选文件。之前是先要密码后静默 return，
-    // 密码框空着点按钮就什么都不会发生 —— 看起来就是「点了没反应」。
-    let password = ui.sub_pwd.text();
-    if password.is_empty() {
-        notify::message(
-            "请先在「证书密码」里填好这张 pfx 的密码，再点「导入 pfx...」。\n\
-             pfx 的密码是导出证书时设定的那一个。",
-            "需要证书密码",
-        );
-        ui.sub_pwd.set_focus();
-        return;
-    }
+// ---------------------------------------------------------------- 证书
 
+/// 选一个 pfx/p12 文件，取消返回 None
+fn pick_pfx(parent: &nwg::Window) -> Option<String> {
     let mut dialog = nwg::FileDialog::default();
     // nwg 的 filters 不是 Win32 那套 "描述|通配符"，它按 '|' 切成若干段，
     // 每段必须写成 "描述(通配符)" 的形式，少一个括号就直接 build 失败。
@@ -403,61 +412,123 @@ fn import_pfx(ui: &Rc<Ui>) {
         .is_err()
     {
         notify::message("无法打开文件选择窗口。", "导入失败");
-        return;
+        return None;
     }
 
-    if !dialog.run(Some(&ui.sub_dlg)) {
-        return;
+    if !dialog.run(Some(parent)) {
+        return None;
     }
-    let Ok(item) = dialog.get_selected_item() else {
+    dialog
+        .get_selected_item()
+        .ok()
+        .map(|i| i.to_string_lossy().to_string())
+}
+
+/// 用 native-tls 先验一遍：密码错或文件坏了直接拒绝，不要存进去。
+/// Windows 上最终调的是 crypt32 的 PFXImportCertStore，错误码能区分
+/// 「密码错」「不含私钥」「格式不认识」，不给出来就只能是「打不开」这种没用的提示。
+fn check_pfx(bytes: &[u8], password: &str) -> Result<(), String> {
+    let Err(e) = native_tls::Identity::from_pkcs12(bytes, password) else {
+        return Ok(());
+    };
+    let detail = format!("{e}");
+    let hint = if detail.contains("0x80070056") || detail.to_lowercase().contains("password") {
+        "密码不对。"
+    } else if detail.contains("0x8009310b") || detail.contains("0x80093102") {
+        "Windows 认不出这个 pfx 的编码格式，重新导出一次试试。"
+    } else {
+        "可能是密码不对，或者导出时没有勾「包含私钥」。"
+    };
+    Err(format!(
+        "这个 pfx 打不开。{hint}\n\n\
+         请在 certmgr 里重新导出一次，务必勾上「包含私钥」，\n\
+         加密方式选「AES-256-SHA256」或「TripleDES-SHA1」都可以。\n\n\
+         原始错误：{detail}"
+    ))
+}
+
+fn pfx_label(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cert")
+        .to_string()
+}
+
+/// 订阅对话框里的「导入 pfx...」：选文件 → 弹密码框 → 校验 → 存进 certs/
+fn import_pfx(ui: &Rc<Ui>) {
+    let Some(path) = pick_pfx(&ui.sub_dlg) else {
         return;
     };
-    let path = item.to_string_lossy().to_string();
-
     let Ok(bytes) = std::fs::read(&path) else {
         notify::message(&format!("读不到这个文件：\n{path}"), "导入失败");
         return;
     };
 
-    // 先用 native-tls 验一遍：密码错或文件坏了直接拒绝，不要存进去。
-    // 这里把底层错误原样带出来 —— Windows 上最终调的是 crypt32 的
-    // PFXImportCertStore，错误码能区分「密码错」「不含私钥」「格式不认识」，
-    // 不给出来就只能是「打不开」这种没用的提示。
-    if let Err(e) = native_tls::Identity::from_pkcs12(&bytes, &password) {
-        let detail = format!("{e}");
-        let hint = if detail.contains("0x80070056") || detail.to_lowercase().contains("password") {
-            "密码不对。"
-        } else if detail.contains("0x8009310b") || detail.contains("0x80093102") {
-            "Windows 认不出这个 pfx 的编码格式，重新导出一次试试。"
-        } else {
-            "可能是密码不对，或者导出时没有勾「包含私钥」。"
+    // 密码错允许重输两次，省得重新选一遍文件
+    for _ in 0..3 {
+        let Some(password) = ui.ask_password(
+            &ui.sub_dlg,
+            "导入客户端证书",
+            "输入这张 pfx 的密码（导出证书时设定的）",
+        ) else {
+            return;
         };
-        notify::message(
-            &format!(
-                "这个 pfx 打不开。{hint}\n\n\
-                 请在 certmgr 里重新导出一次，务必勾上「包含私钥」，\n\
-                 加密方式选「AES-256-SHA256」或「TripleDES-SHA1」都可以。\n\n\
-                 原始错误：{detail}"
-            ),
-            "导入失败",
-        );
-        return;
-    }
-
-    let label = std::path::Path::new(&path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("cert")
-        .to_string();
-
-    match config::save_cert(&bytes, &password, &label) {
-        Some(id) => {
-            *ui.cert_sel.borrow_mut() = Some(id.clone());
-            ui.set_cert_display(&Some(id));
+        match check_pfx(&bytes, &password) {
+            Ok(()) => {
+                match config::save_cert(&bytes, &password, &pfx_label(&path)) {
+                    Some(id) => {
+                        *ui.cert_sel.borrow_mut() = Some(id.clone());
+                        ui.set_cert_display(&Some(id));
+                        ui.refresh_certs();
+                    }
+                    None => notify::message("证书保存失败：写不进配置目录。", "导入失败"),
+                }
+                return;
+            }
+            Err(reason) => notify::message(&reason, "导入失败"),
         }
-        None => notify::message("证书保存失败：写不进配置目录。", "导入失败"),
     }
 }
+
+/// 设置页的「替换」：只换掉证书文件本身，id 和显示名都不动。
+/// 引用它的服务器不用改配置，但必须重连才会用上新证书。
+fn replace_selected_cert(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
+    let Some(id) = ui.selected_cert_id() else {
+        return;
+    };
+    let Some(path) = pick_pfx(&ui.set_dlg) else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        notify::message(&format!("读不到这个文件：\n{path}"), "替换失败");
+        return;
+    };
+
+    for _ in 0..3 {
+        let Some(password) = ui.ask_password(
+            &ui.set_dlg,
+            "替换客户端证书",
+            "输入新 pfx 的密码（导出证书时设定的）",
+        ) else {
+            return;
+        };
+        match check_pfx(&bytes, &password) {
+            Ok(()) => {
+                if !config::overwrite_cert(&id, &bytes, &password) {
+                    notify::message("替换失败：写不进证书文件。", "替换失败");
+                    return;
+                }
+                ui.refresh_certs();
+                ui.select_cert(&id);
+                restart_network(ctx, rt);
+                return;
+            }
+            Err(reason) => notify::message(&reason, "替换失败"),
+        }
+    }
+}
+
 
 /// 删除设置页里选中的证书。引用它的服务器会一并改成「不使用证书」，
 /// 否则那条订阅会指向一个已经删掉的文件，重连时报错。

@@ -283,6 +283,19 @@ pub fn save_cert(pfx: &[u8], password: &str, label: &str) -> Option<String> {
     Some(id)
 }
 
+/// 用同一 id 覆盖已存证书（替换文件，id 和显示名都保留）。
+/// 引用这张证书的服务器不用改配置，但必须重启连接才会用上新证书。
+pub fn overwrite_cert(id: &str, pfx: &[u8], password: &str) -> bool {
+    let blob = CertBlob { pfx: b64_encode(pfx), password: password.to_string() };
+    let Ok(json) = serde_json::to_vec(&blob) else {
+        return false;
+    };
+    let Some(enc) = protect(&json) else {
+        return false;
+    };
+    fs::write(certs_dir().join(format!("{id}.bin")), enc).is_ok()
+}
+
 pub fn load_cert(id: &str) -> Option<(Vec<u8>, String)> {
     let raw = fs::read(certs_dir().join(format!("{id}.bin"))).ok()?;
     let json = unprotect(&raw)?;

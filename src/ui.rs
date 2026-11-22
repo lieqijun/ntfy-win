@@ -98,6 +98,46 @@ pub fn center_on(parent: &nwg::Window, child: &nwg::Window) {
     }
 }
 
+// ---------------------------------------------------------------- 模态
+
+/// 抬到前台，顺手还原最小化状态
+fn force_front(win: &nwg::Window) {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+        };
+        if let Some(h) = raw_hwnd(win) {
+            ShowWindow(h, if IsIconic(h) != 0 { SW_RESTORE } else { SW_SHOW });
+            SetForegroundWindow(h);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = win;
+}
+
+/// 局部消息循环：一直转到 done 置位。
+/// 密码框靠它做成模态 —— 期间只在这个循环里派发消息，父窗口又是禁用状态，
+/// 用户点不到别处，密码框也不会被埋到别的窗口后面。
+fn run_modal(done: &Cell<bool>) {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, GetMessageW, TranslateMessage, MSG,
+        };
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            if done.get() {
+                break;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = done;
+}
+
 // ---------------------------------------------------------------- 结构
 
 pub struct Ui {
@@ -120,20 +160,31 @@ pub struct Ui {
     pub sub_cert_value: nwg::Label,
     pub sub_import: nwg::Button,
     pub sub_clear: nwg::Button,
-    pub sub_pwd_label: nwg::Label,
-    pub sub_pwd: nwg::TextInput,
     pub sub_ok: nwg::Button,
     pub sub_cancel: nwg::Button,
+
+    /// 导入/替换证书时弹出的密码框（模态）
+    pub pwd_dlg: nwg::Window,
+    pub pwd_hint: nwg::Label,
+    pub pwd_input: nwg::TextInput,
+    pub pwd_ok: nwg::Button,
+    pub pwd_cancel: nwg::Button,
 
     pub set_dlg: nwg::Window,
     pub set_autostart: nwg::CheckBox,
     pub set_copy: nwg::CheckBox,
     pub set_cert_title: nwg::Label,
     pub set_cert_list: nwg::ListBox<String>,
+    pub set_cert_rep: nwg::Button,
     pub set_cert_del: nwg::Button,
     pub set_cert_hint: nwg::Label,
     pub set_ok: nwg::Button,
     pub set_cancel: nwg::Button,
+
+    /// 密码框是否已经收工（确定/取消/关窗都会置位），模态循环靠它退出
+    pub pwd_done: Rc<Cell<bool>>,
+    /// 密码框的结果：Some(密码) 表示点了确定
+    pub pwd_result: Rc<RefCell<Option<String>>>,
 
     /// 订阅对话框里当前选中的证书 id
     pub cert_sel: Rc<RefCell<Option<String>>>,
@@ -162,11 +213,15 @@ const BTN_W: i32 = 80;
 const BTN_H: i32 = 28;
 
 const SUB_H_BASIC: i32 = 164;
-const SUB_H_ADVANCED: i32 = 236;
+const SUB_H_ADVANCED: i32 = 190;
 const SUB_BTN_Y_BASIC: i32 = 124;
-const SUB_BTN_Y_ADVANCED: i32 = 196;
+const SUB_BTN_Y_ADVANCED: i32 = 152;
 
 const SET_H: i32 = 262;
+
+// 证书密码框客户区（逻辑像素）
+const PWD_W: i32 = 372;
+const PWD_H: i32 = 140;
 
 impl Ui {
     pub fn build() -> Result<(Ui, Ctx), nwg::NwgError> {
@@ -376,21 +431,48 @@ impl Ui {
             .size((s(90), s(26)))
             .build(&mut sub_clear)?;
 
-        let mut sub_pwd_label = nwg::Label::default();
-        nwg::Label::builder()
-            .parent(&sub_dlg)
-            .text("证书密码:")
-            .position((s(16), s(157)))
-            .size((s(LABEL_W), s(20)))
-            .build(&mut sub_pwd_label)?;
+        // ---------------- 证书密码框（导入/替换时弹，用完就藏） ----------------
+        let mut pwd_dlg = nwg::Window::default();
+        nwg::Window::builder()
+            .parent(Some(&window))
+            .flags(nwg::WindowFlags::WINDOW)
+            .size((s(PWD_W), s(PWD_H)))
+            .position((s(560), s(400)))
+            .title("证书密码")
+            .build(&mut pwd_dlg)?;
+        fit_client(&pwd_dlg, s(PWD_W), s(PWD_H));
 
-        let mut sub_pwd = nwg::TextInput::default();
+        let mut pwd_hint = nwg::Label::default();
+        nwg::Label::builder()
+            .parent(&pwd_dlg)
+            .text("输入这张 pfx 的密码")
+            .position((s(16), s(14)))
+            .size((s(340), s(20)))
+            .build(&mut pwd_hint)?;
+
+        let mut pwd_input = nwg::TextInput::default();
         nwg::TextInput::builder()
-            .parent(&sub_dlg)
-            .position((s(FIELD_X), s(154)))
-            .size((s(220), s(ROW_H)))
-            .build(&mut sub_pwd)?;
-        sub_pwd.set_password_char(Some('*'));
+            .parent(&pwd_dlg)
+            .position((s(16), s(44)))
+            .size((s(340), s(28)))
+            .build(&mut pwd_input)?;
+        pwd_input.set_password_char(Some('*'));
+
+        let mut pwd_ok = nwg::Button::default();
+        nwg::Button::builder()
+            .parent(&pwd_dlg)
+            .text("确定")
+            .position((s(196), s(90)))
+            .size((s(BTN_W), s(BTN_H)))
+            .build(&mut pwd_ok)?;
+
+        let mut pwd_cancel = nwg::Button::default();
+        nwg::Button::builder()
+            .parent(&pwd_dlg)
+            .text("取消")
+            .position((s(276), s(90)))
+            .size((s(BTN_W), s(BTN_H)))
+            .build(&mut pwd_cancel)?;
 
         let mut sub_ok = nwg::Button::default();
         nwg::Button::builder()
@@ -452,11 +534,20 @@ impl Ui {
             .flags(nwg::ListBoxFlags::VISIBLE | nwg::ListBoxFlags::TAB_STOP)
             .build(&mut set_cert_list)?;
 
+        let mut set_cert_rep = nwg::Button::default();
+        nwg::Button::builder()
+            .parent(&set_dlg)
+            .text("替换")
+            .position((s(292), s(112)))
+            .size((s(72), s(26)))
+            .build(&mut set_cert_rep)?;
+        set_cert_rep.set_enabled(false);
+
         let mut set_cert_del = nwg::Button::default();
         nwg::Button::builder()
             .parent(&set_dlg)
             .text("删除")
-            .position((s(292), s(112)))
+            .position((s(292), s(146)))
             .size((s(72), s(26)))
             .build(&mut set_cert_del)?;
         set_cert_del.set_enabled(false);
@@ -464,7 +555,7 @@ impl Ui {
         let mut set_cert_hint = nwg::Label::default();
         nwg::Label::builder()
             .parent(&set_dlg)
-            .text("删除后，引用它的服务器会改为不使用证书。")
+            .text("替换只换证书文件；删除会让服务器不再使用证书。")
             .position((s(16), s(200)))
             .size((s(348), s(18)))
             .build(&mut set_cert_hint)?;
@@ -504,19 +595,25 @@ impl Ui {
             sub_cert_value,
             sub_import,
             sub_clear,
-            sub_pwd_label,
-            sub_pwd,
             sub_ok,
             sub_cancel,
+            pwd_dlg,
+            pwd_hint,
+            pwd_input,
+            pwd_ok,
+            pwd_cancel,
             set_dlg,
             set_autostart,
             set_copy,
             set_cert_title,
             set_cert_list,
+            set_cert_rep,
             set_cert_del,
             set_cert_hint,
             set_ok,
             set_cancel,
+            pwd_done: Rc::new(Cell::new(false)),
+            pwd_result: Rc::new(RefCell::new(None)),
             cert_sel: Rc::new(RefCell::new(None)),
             advanced: Rc::new(Cell::new(false)),
         };
@@ -575,7 +672,6 @@ impl Ui {
 
     pub fn open_subscribe(&self, cfg: &Config) {
         self.sub_topic.set_text("");
-        self.sub_pwd.set_text("");
         self.sub_token.set_text("");
 
         let last = if cfg.last_server.is_empty() {
@@ -624,8 +720,6 @@ impl Ui {
         self.sub_cert_value.set_visible(advanced);
         self.sub_import.set_visible(advanced);
         self.sub_clear.set_visible(advanced);
-        self.sub_pwd_label.set_visible(advanced);
-        self.sub_pwd.set_visible(advanced);
 
         let h = if advanced { SUB_H_ADVANCED } else { SUB_H_BASIC };
         fit_client(&self.sub_dlg, px(DLG_W) as i32, px(h) as i32);
@@ -633,6 +727,42 @@ impl Ui {
         let y = if advanced { SUB_BTN_Y_ADVANCED } else { SUB_BTN_Y_BASIC };
         self.sub_ok.set_position(scale(270), scale(y));
         self.sub_cancel.set_position(scale(364), scale(y));
+    }
+
+    // ------------------------------------------------------------ 证书密码框
+
+    /// 弹密码框并等用户操作完。返回 Some(密码) 表示点了确定；取消/关窗返回 None。
+    /// 等待期间父窗口禁用，结束后恢复并把父窗口拉回前台。
+    pub fn ask_password(&self, parent: &nwg::Window, title: &str, hint: &str) -> Option<String> {
+        self.pwd_dlg.set_text(title);
+        self.pwd_hint.set_text(hint);
+        self.pwd_input.set_text("");
+        *self.pwd_result.borrow_mut() = None;
+        self.pwd_done.set(false);
+
+        center_on(parent, &self.pwd_dlg);
+        parent.set_enabled(false);
+        // 主窗口被禁用时有的窗口会连带变灰，这里强开一次，别让密码框点不动
+        self.pwd_dlg.set_enabled(true);
+        self.pwd_dlg.set_visible(true);
+        force_front(&self.pwd_dlg);
+        self.pwd_input.set_focus();
+
+        run_modal(&self.pwd_done);
+
+        self.pwd_dlg.set_visible(false);
+        parent.set_enabled(true);
+        force_front(parent);
+
+        self.pwd_result.borrow_mut().take()
+    }
+
+    /// 确定/取消/关窗都走这里：置结束标志，模态循环随即退出
+    pub fn finish_password(&self, accept: bool) {
+        if accept {
+            *self.pwd_result.borrow_mut() = Some(self.pwd_input.text());
+        }
+        self.pwd_done.set(true);
     }
 
     // ------------------------------------------------------------ 设置对话框
@@ -671,7 +801,7 @@ impl Ui {
             })
             .collect();
         let _ = self.set_cert_list.set_collection(items);
-        self.set_cert_del.set_enabled(false);
+        self.sync_cert_buttons();
     }
 
     pub fn selected_cert_id(&self) -> Option<String> {
@@ -679,10 +809,19 @@ impl Ui {
         config::list_certs().get(index).map(|c| c.id.clone())
     }
 
-    /// 选中项变化时同步「删除」按钮的可用状态
-    pub fn sync_cert_del(&self) {
-        self.set_cert_del
-            .set_enabled(self.set_cert_list.selection().is_some());
+    /// 刷新后重新选中某个 id，替换证书后用来保持选中状态
+    pub fn select_cert(&self, id: &str) {
+        if let Some(index) = config::list_certs().iter().position(|c| c.id == id) {
+            self.set_cert_list.set_selection(Some(index));
+        }
+        self.sync_cert_buttons();
+    }
+
+    /// 选中项变化时同步「替换」「删除」两个按钮的可用状态
+    pub fn sync_cert_buttons(&self) {
+        let on = self.set_cert_list.selection().is_some();
+        self.set_cert_rep.set_enabled(on);
+        self.set_cert_del.set_enabled(on);
     }
 
     /// 关闭子对话框后把主窗口拉回前台，否则它会掉到别的窗口后面
