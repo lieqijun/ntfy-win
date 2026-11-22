@@ -7,7 +7,6 @@ mod tray;
 mod ui;
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use native_windows_gui as nwg;
 
@@ -66,15 +65,11 @@ fn main() {
     ui.refresh_list(&ctx.cfg.borrow());
     restart_network(&ctx, rt.handle());
 
-    let mut timer = nwg::AnimationTimer::default();
-    let _ = nwg::AnimationTimer::builder()
-        .parent(&ui.window)
-        .interval(Duration::from_millis(200))
-        .active(true)
-        .build(&mut timer);
+    // 200ms 一次节拍：轮询托盘点击/菜单事件、同步「移除」按钮状态。
+    // 用系统定时器，不再占用 nwg AnimationTimer 的那个 1ms 轮询线程。
+    ui.start_tick(200);
 
     let handlers = bind_handlers(&ui, &ctx, rt.handle().clone());
-
     // --silent 用于开机自启：只在托盘，不弹窗口
     let silent = std::env::args().any(|a| a == "--silent");
     ui.window.set_visible(!silent);
@@ -84,7 +79,7 @@ fn main() {
     for h in &handlers {
         nwg::unbind_event_handler(h);
     }
-    drop(timer);
+    ui.stop_tick();
 }
 
 // ---------------------------------------------------------------- 单实例
@@ -190,19 +185,23 @@ fn poll_tray(ui: &Rc<Ui>, ctx: &Rc<Ctx>) {
     // 「移除」只在选中行之后可点，跟着选择状态每 200ms 对一次
     ui.sync_remove_enabled(ctx.cfg.borrow().subscriptions.len());
 
+    // 左键单击托盘图标 = 打开主窗口
+    if tray::left_clicked() {
+        ui.show_main();
+    }
+
     while let Some(id) = tray::next_menu_id() {
         match id.as_str() {
             "open" => {
-                ui.window.set_visible(true);
-                ui.window.set_focus();
+                ui.show_main();
             }
             "add" => {
-                ui.window.set_visible(true);
+                ui.show_main();
                 let cfg = ctx.cfg.borrow();
                 ui.open_subscribe(&cfg);
             }
             "settings" => {
-                ui.window.set_visible(true);
+                ui.show_main();
                 let cfg = ctx.cfg.borrow();
                 ui.open_settings(&cfg);
             }

@@ -1,7 +1,7 @@
 //! 托盘图标与右键菜单。
 
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 pub struct Tray {
     icon: TrayIcon,
@@ -74,6 +74,24 @@ pub fn next_menu_id() -> Option<String> {
         Ok(event) => Some(event.id.0.clone()),
         Err(_) => None,
     }
+}
+
+/// 托盘图标被左键单击。
+/// Windows 会为一次点击同时发 down 和 up 两条事件，只认 up，否则窗口会开两次；
+/// 双击本身也带一次 up，所以双击同样能打开。
+pub fn left_clicked() -> bool {
+    let mut hit = false;
+    while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = event
+        {
+            hit = true;
+        }
+    }
+    hit
 }
 
 pub const COLOR_OK: [u8; 3] = [0x1f, 0x7a, 0xe0];

@@ -42,6 +42,9 @@ fn raw_handle(h: &nwg::ControlHandle) -> Option<*mut core::ffi::c_void> {
     h.hwnd().map(|x| x as *mut core::ffi::c_void)
 }
 
+/// 节拍定时器的 id，只需要在本程序内唯一
+const TICK_ID: usize = 1;
+
 #[cfg(windows)]
 fn raw_hwnd(win: &nwg::Window) -> Option<*mut core::ffi::c_void> {
     raw_handle(&win.handle)
@@ -621,6 +624,52 @@ impl Ui {
         unsafe {
             if let Some(h) = raw_hwnd(&self.window) {
                 windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(h);
+            }
+        }
+    }
+
+    /// 从托盘把主窗口叫回前台。
+    /// 不能用 set_visible + set_focus 了事：窗口若是最小化的，只显示不会还原；
+    /// 而且 SetFocus 只在同一线程内有效，跨进程/从托盘唤起需要 SetForegroundWindow。
+    pub fn show_main(&self) {
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+            };
+
+            if let Some(h) = raw_hwnd(&self.window) {
+                let restoring = IsIconic(h) != 0;
+                ShowWindow(h, if restoring { SW_RESTORE } else { SW_SHOW });
+                SetForegroundWindow(h);
+            } else {
+                self.window.set_visible(true);
+            }
+        }
+        #[cfg(not(windows))]
+        self.window.set_visible(true);
+    }
+
+    /// 周期节拍（轮询托盘事件、同步按钮状态）。
+    /// 用系统的 SetTimer 而不是 nwg 的 AnimationTimer：后者在后台开一个线程，
+    /// 每 1ms 抢一次锁扫一遍定时器列表，托盘常驻时白烧 CPU。WM_TIMER 走消息
+    /// 队列，系统在窗口空闲时才投递，几乎没有额外开销。
+    pub fn start_tick(&self, ms: u32) {
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::SetTimer;
+            if let Some(h) = raw_hwnd(&self.window) {
+                SetTimer(h, TICK_ID, ms, None);
+            }
+        }
+    }
+
+    pub fn stop_tick(&self) {
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::KillTimer;
+            if let Some(h) = raw_hwnd(&self.window) {
+                KillTimer(h, TICK_ID);
             }
         }
     }
