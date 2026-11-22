@@ -1,0 +1,5 @@
+/target
+/dist
+*.zip
+icon-dark.png
+icon-light.png

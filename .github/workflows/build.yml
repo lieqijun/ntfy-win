@@ -1,0 +1,60 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 计算北京时间版本号
+        id: ver
+        shell: pwsh
+        run: |
+          $dt = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId((Get-Date), 'China Standard Time')
+          $tag = $dt.ToString("yyyyMMdd-HHmmss")
+          Write-Host "version = $tag"
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (x64, static CRT)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/ntfy-win.exe dist/
+          Compress-Archive -Path dist/* -DestinationPath "ntfy-win-${{ steps.ver.outputs.tag }}-x64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ntfy-win-${{ steps.ver.outputs.tag }}
+          path: ntfy-win-${{ steps.ver.outputs.tag }}-x64.zip
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          files: ntfy-win-${{ steps.ver.outputs.tag }}-x64.zip
+          generate_release_notes: true
