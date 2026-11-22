@@ -3,14 +3,21 @@
 //! ntfy 的 WebSocket 端点格式是 `/<topic>/ws`，主题在路径里，多个主题用逗号分隔：
 //! `wss://host/topic1,topic2/ws?since=12h`。没有裸 `/ws` 这种端点。
 //! 连上之后客户端不需要再发任何消息，服务器直接推 JSON 帧。
+//!
+//! 这里用的是阻塞 IO + 一服务器一线程：TLS 由 SChannel 直接接手系统证书库里的
+//! 证书句柄，tokio 那套只能吃 pfx 文件，用不上。
 
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::StreamExt;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async_tls_with_config, Connector};
+use schannel::tls_stream;
+use tungstenite::client::IntoClientRequest;
+use tungstenite::http::header::HeaderValue;
+use tungstenite::protocol::WebSocketConfig;
+use tungstenite::Message;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnState {
@@ -27,6 +34,38 @@ pub enum NetEvent {
 }
 
 pub type Sink = Arc<dyn Fn(NetEvent) + Send + Sync>;
+
+/// 明文和 TLS 两种底层用一个枚举收拢，省得为了 Read/Write 上 trait object
+enum Sock {
+    Plain(TcpStream),
+    Tls(Box<tls_stream::TlsStream<TcpStream>>),
+}
+
+impl Read for Sock {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Sock::Plain(s) => s.read(buf),
+            Sock::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Sock {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Sock::Plain(s) => s.write(buf),
+            Sock::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Sock::Plain(s) => s.flush(),
+            Sock::Tls(s) => s.flush(),
+        }
+    }
+}
+
 
 enum Outcome {
     /// 认证失败或端点不存在，重试没有意义
@@ -57,16 +96,17 @@ pub fn ws_endpoint(server: &str, topics: &[String], since: &str) -> String {
     }
 }
 
-/// 为一台服务器起一个常驻 task
+/// 为一台服务器起一个常驻线程。stop 置位后线程会在下一次检查时退出。
 pub fn spawn_server(
-    handle: &tokio::runtime::Handle,
     server: String,
     token: String,
+    thumb: Option<String>,
     topics: Vec<String>,
-    identity: Option<native_tls::Identity>,
     sink: Sink,
-) -> tokio::task::JoinHandle<()> {
-    handle.spawn(async move {
+    stop: Arc<AtomicBool>,
+) {
+    let name = format!("ws {server}");
+    let spawned = std::thread::Builder::new().name(name).spawn(move || {
         if topics.is_empty() {
             return;
         }
@@ -75,30 +115,35 @@ pub fn spawn_server(
         // 该服务器上已收到的最后一条消息时间（Unix 秒），重连时用来补漏
         let last_seen: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
         // 本轮是否真的订阅成功过，用来决定要不要把退避重置
-        let reached: Arc<std::sync::atomic::AtomicBool> =
-            Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reached = Arc::new(AtomicBool::new(false));
 
         loop {
-            reached.store(false, std::sync::atomic::Ordering::Relaxed);
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            reached.store(false, Ordering::Relaxed);
 
             let outcome = connect_once(
                 &server,
                 &token,
+                thumb.as_deref(),
                 &topics,
-                identity.clone(),
                 &last_seen,
                 &reached,
                 &sink,
-            )
-            .await;
+                &stop,
+            );
 
             // 连上过又断了，说明网络是通的，退避从头算，不要一直卡在 60 秒
-            if reached.load(std::sync::atomic::Ordering::Relaxed) {
+            if reached.load(Ordering::Relaxed) {
                 backoff = 1;
             }
 
             match outcome {
                 Outcome::Fatal(detail) => {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
                     sink(NetEvent::State {
                         server: server.clone(),
                         state: ConnState::AuthFailed,
@@ -107,6 +152,9 @@ pub fn spawn_server(
                     return;
                 }
                 Outcome::Lost(detail) => {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
                     sink(NetEvent::State {
                         server: server.clone(),
                         state: ConnState::Disconnected,
@@ -115,23 +163,32 @@ pub fn spawn_server(
                 }
             }
 
-            // ±20% 抖动，避免多客户端同时重连
+            // ±20% 抖动，避免多客户端同时重连。按 200ms 切片睡，收到停止信号能早点走。
             let jitter = (backoff as f64 * 0.2 * pseudo_random()).round() as u64;
             let wait = backoff.saturating_add(jitter).max(1);
-            tokio::time::sleep(Duration::from_secs(wait)).await;
+            for _ in 0..(wait * 5) {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
             backoff = (backoff * 2).clamp(1, 60);
         }
-    })
+    });
+
+    // Ok 就 detach（停止靠 stop 标志），Err 说明线程起不来，也只能作罢
+    let _ = spawned;
 }
 
-async fn connect_once(
+fn connect_once(
     server: &str,
     token: &str,
+    thumb: Option<&str>,
     topics: &[String],
-    identity: Option<native_tls::Identity>,
     last_seen: &Arc<Mutex<Option<i64>>>,
-    reached: &Arc<std::sync::atomic::AtomicBool>,
+    reached: &Arc<AtomicBool>,
     sink: &Sink,
+    stop: &Arc<AtomicBool>,
 ) -> Outcome {
     // 首次连上不带 since（只收新消息）；断线重连才从最后一条消息往后接，
     // 这样既不会漏掉断开期间的消息，也不会把整个缓存重放一遍
@@ -142,6 +199,99 @@ async fn connect_once(
 
     let url = ws_endpoint(server, topics, &since);
 
+    let uri = match url.parse::<tungstenite::http::Uri>() {
+        Ok(u) => u,
+        Err(e) => return Outcome::Fatal(format!("服务器地址无效（{url}）：{e}")),
+    };
+
+    // 只有 wss 才走 TLS，其余按明文处理
+    let secure = uri.scheme_str() == Some("wss");
+    let host = match uri.host() {
+        Some(h) if !h.is_empty() => h.to_string(),
+        _ => return Outcome::Fatal(format!("地址里没有主机名：{url}")),
+    };
+    let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
+
+    // ---------------- TCP ----------------
+    let addrs: Vec<_> = match (host.as_str(), port).to_socket_addrs() {
+        Ok(it) => it.collect(),
+        Err(e) => return Outcome::Lost(format!("解析不了「{host}」：{e}")),
+    };
+    if addrs.is_empty() {
+        return Outcome::Lost(format!("「{host}」解析不出任何地址，DNS 可能有问题。"));
+    }
+
+    let mut last_err = String::new();
+    let mut connected = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, Duration::from_secs(15)) {
+            Ok(s) => {
+                connected = Some(s);
+                break;
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    let Some(tcp) = connected else {
+        return Outcome::Lost(format!(
+            "连不上 {host}:{port}（15 秒超时）。\n{last_err}\n\n\
+             地址或端口不通，也可能被防火墙挡了。"
+        ));
+    };
+
+    let _ = tcp.set_nodelay(true);
+    // 握手阶段用短超时，连上之后再把读超时放宽到 90 秒（见下）
+    let _ = tcp.set_read_timeout(Some(Duration::from_secs(15)));
+    let _ = tcp.set_write_timeout(Some(Duration::from_secs(15)));
+    // 留一份句柄：TlsStream 拿走所有权后还能改超时
+    let ctl = tcp.try_clone().ok();
+
+    // ---------------- TLS ----------------
+    let stream: Sock = if secure {
+        let cred = match thumb {
+            Some(t) => match crate::cert::find(t) {
+                Some(cert) => match crate::cert::client_cred(cert) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Outcome::Fatal(format!(
+                            "证书 {t} 无法用于 TLS 握手：{e}\n\
+                             私钥可能不可用（受保护、被锁，或装在了别的账户下）。"
+                        ))
+                    }
+                },
+                None => {
+                    return Outcome::Fatal(format!(
+                        "系统证书库里找不到指纹 {t} 的证书。\n\n\
+                         确认三件事：\n\
+                         1. 证书装在「当前用户 → 个人 → 证书」或「本地计算机 → 个人 → 证书」里；\n\
+                         2. 指纹是 certmgr 里那串 40 位十六进制，没抄错位；\n\
+                         3. 导出时勾了「包含私钥」，或者本来就是这台机器上申请的。"
+                    ))
+                }
+            },
+            None => match crate::cert::anonymous_cred() {
+                Ok(c) => c,
+                Err(e) => return Outcome::Lost(format!("初始化 TLS 失败：{e}")),
+            },
+        };
+
+        let mut builder = tls_stream::Builder::new();
+        builder.domain(&host);
+        match builder.connect(cred, tcp) {
+            Ok(s) => Sock::Tls(Box::new(s)),
+            Err(e) => {
+                return Outcome::Lost(format!(
+                    "TLS 握手失败（{host}）。\n{e}\n\n\
+                     如果是自建服务器用了自签证书，需要把签发它的根证书导入\n\
+                     「受信任的根证书颁发机构」，否则服务器身份没法验证。"
+                ))
+            }
+        }
+    } else {
+        Sock::Plain(tcp)
+    };
+
+    // ---------------- WebSocket 握手 ----------------
     let mut request = match url.clone().into_client_request() {
         Ok(r) => r,
         Err(e) => return Outcome::Fatal(format!("服务器地址无效（{url}）：{e}")),
@@ -149,65 +299,59 @@ async fn connect_once(
     {
         let headers = request.headers_mut();
         if !token.is_empty() {
-            if let Ok(v) = format!("Bearer {token}").parse() {
+            if let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}")) {
                 headers.insert("authorization", v);
             }
         }
-        if let Ok(v) = "ntfy-win/0.1".parse() {
-            headers.insert("user-agent", v);
-        }
+        headers.insert("user-agent", HeaderValue::from_static("ntfy-win/2.0"));
     }
 
-    let connector = match identity {
-        Some(id) => match native_tls::TlsConnector::builder().identity(id).build() {
-            Ok(tls) => Some(Connector::NativeTls(tls)),
-            Err(e) => {
-                return Outcome::Fatal(format!(
-                    "客户端证书无法用于 TLS 握手：{e}\n请重新导出 pfx，确认勾选了包含私钥。"
-                ))
-            }
-        },
-        None => None,
+    let config = WebSocketConfig {
+        max_message_size: Some(4 * 1024 * 1024),
+        max_frame_size: Some(4 * 1024 * 1024),
+        ..Default::default()
     };
 
-    let connect = connect_async_tls_with_config(request, None, false, connector);
-    let (mut ws, _resp) = match tokio::time::timeout(Duration::from_secs(15), connect).await {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(err)) => {
-            let detail = describe(&err, &url);
-            return if is_fatal(&err) { Outcome::Fatal(detail) } else { Outcome::Lost(detail) };
-        }
-        Err(_) => {
-            return Outcome::Lost(format!(
-                "连接 {url} 超时（15 秒）。可能是地址或端口不通、证书被拒绝，或服务器没开。"
-            ))
+    let (mut ws, _resp) = match tungstenite::client::client_with_config(request, stream, Some(config)) {
+        Ok(v) => v,
+        Err(e) => {
+            let raw = format!("{e}");
+            let detail = describe(&raw, &url);
+            return if is_fatal(&raw) { Outcome::Fatal(detail) } else { Outcome::Lost(detail) };
         }
     };
+
+    // ntfy 的 WebSocket 上服务器会定时发 ping（默认 45 秒），正常连接不会真的安静 90 秒。
+    // 读超时只用来兜住死链：底层 socket 一超时就说明这条连接已经没救了。
+    if let Some(c) = &ctl {
+        let _ = c.set_read_timeout(Some(Duration::from_secs(90)));
+    }
 
     // 连上不等于订阅成功：ntfy 会先回一帧 {"event":"open","topic":"..."}。
     // 等不到这一帧就说明主题没订上，不能算连接成功。
     let mut announced = false;
     loop {
-        let wait: u64 = if announced { 90 } else { 20 };
-        let next = tokio::time::timeout(Duration::from_secs(wait), ws.next()).await;
+        if stop.load(Ordering::Relaxed) {
+            return Outcome::Lost(String::new());
+        }
 
-        let msg = match next {
-            Err(_) => {
-                return if announced {
-                    Outcome::Lost("90 秒没收到任何数据，判定连接已死。".to_string())
-                } else {
-                    Outcome::Lost(format!(
-                        "已建立连接，但 20 秒内没收到 ntfy 的 open 事件。\n\
-                         端点：{url}\n主题是否拼错？服务器是否支持 WebSocket？"
-                    ))
+        let msg = match ws.read() {
+            Ok(m) => m,
+            Err(e) => {
+                if is_timeout(&e) {
+                    return Outcome::Lost(if announced {
+                        "90 秒没收到任何数据，判定连接已死。".to_string()
+                    } else {
+                        format!(
+                            "连上了，但 90 秒内没收到 ntfy 的 open 事件。\n\
+                             端点：{url}\n主题是否拼错？服务器是否支持 WebSocket？"
+                        )
+                    });
                 }
+                let raw = format!("{e}");
+                let detail = describe(&raw, &url);
+                return if is_fatal(&raw) { Outcome::Fatal(detail) } else { Outcome::Lost(detail) };
             }
-            Ok(None) => return Outcome::Lost("服务器关闭了连接。".to_string()),
-            Ok(Some(Err(err))) => {
-                let detail = describe(&err, &url);
-                return if is_fatal(&err) { Outcome::Fatal(detail) } else { Outcome::Lost(detail) };
-            }
-            Ok(Some(Ok(m))) => m,
         };
 
         match msg {
@@ -227,6 +371,10 @@ async fn connect_once(
                     .unwrap_or_default();
                 return Outcome::Lost(format!("服务器关闭了连接{why}"));
             }
+            // Ping/Pong 由 tungstenite 自己排队应答，这里把排队的帧冲出去
+            Message::Ping(_) | Message::Pong(_) => {
+                let _ = ws.flush();
+            }
             _ => {}
         }
     }
@@ -237,14 +385,14 @@ fn take_open(
     text: &str,
     announced: &mut bool,
     server: &str,
-    reached: &Arc<std::sync::atomic::AtomicBool>,
+    reached: &Arc<AtomicBool>,
     sink: &Sink,
 ) {
     if *announced || !is_open_event(text) {
         return;
     }
     *announced = true;
-    reached.store(true, std::sync::atomic::Ordering::Relaxed);
+    reached.store(true, Ordering::Relaxed);
     sink(NetEvent::State {
         server: server.to_string(),
         state: ConnState::Connected,
@@ -289,10 +437,21 @@ fn handle_frame(text: &str, last_seen: &Arc<Mutex<Option<i64>>>, sink: &Sink) {
     sink(NetEvent::Message { topic: topic_name, title, body });
 }
 
-/// tungstenite 的 Display 已经带了足够信息（HTTP 状态码、TLS 错误文本），
-/// 直接用它，比按变体拆更不容易写错。这里只额外补一句证书链的中文提示。
-fn describe(err: &tokio_tungstenite::tungstenite::Error, url: &str) -> String {
-    let raw = format!("{err}");
+/// 底层 socket 的读超时，说明 90 秒没数据了
+fn is_timeout(err: &tungstenite::Error) -> bool {
+    if let tungstenite::Error::Io(e) = err {
+        return matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        );
+    }
+    let lower = format!("{err}").to_lowercase();
+    lower.contains("timed out") || lower.contains("10060") || lower.contains("would block")
+}
+
+/// 错误文本里已经带了足够信息（HTTP 状态码、TLS 错误），直接用它，
+/// 只额外补一句自签证书的中文提示。
+fn describe(raw: &str, url: &str) -> String {
     let lower = raw.to_lowercase();
 
     if lower.contains("certificate")
@@ -323,8 +482,7 @@ fn describe(err: &tokio_tungstenite::tungstenite::Error, url: &str) -> String {
 
 /// 认证失败 / 端点不存在 —— 这类错误重试多少次都一样。
 /// 5xx 不算，服务器临时故障还是应该重试。
-fn is_fatal(err: &tokio_tungstenite::tungstenite::Error) -> bool {
-    let raw = format!("{err}");
+fn is_fatal(raw: &str) -> bool {
     raw.contains("401") || raw.contains("403") || raw.contains("404")
 }
 

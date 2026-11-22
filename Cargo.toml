@@ -1,6 +1,6 @@
 [package]
 name = "ntfy-win"
-version = "1.0.1"
+version = "2.0.0"
 edition = "2021"
 description = "Minimal ntfy push client that lives in the Windows tray"
 license = "MIT"
@@ -10,10 +10,9 @@ build = "build.rs"
 native-windows-gui = "1.0.13"
 tray-icon = "0.19"
 tauri-winrt-notification = "0.2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-futures-util = "0.3"
-native-tls = "0.2"
+# 阻塞版 websocket + schannel：证书从系统证书库按指纹取，不再解析 pfx
+tungstenite = "0.24"
+schannel = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"

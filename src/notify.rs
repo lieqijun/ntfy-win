@@ -105,30 +105,6 @@ pub fn message(text: &str, title: &str) {
 #[cfg(not(windows))]
 pub fn message(_text: &str, _title: &str) {}
 
-/// 确认框，点「是」返回 true。删除这类不可撤销的操作先用它问一句。
-#[cfg(windows)]
-pub fn confirm(text: &str, title: &str) -> bool {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, IDYES, MB_ICONQUESTION, MB_YESNO,
-    };
-
-    let text = wide(text);
-    let title = wide(title);
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            text.as_ptr(),
-            title.as_ptr(),
-            MB_YESNO | MB_ICONQUESTION,
-        ) == IDYES
-    }
-}
-
-#[cfg(not(windows))]
-pub fn confirm(_text: &str, _title: &str) -> bool {
-    false
-}
-
 #[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()

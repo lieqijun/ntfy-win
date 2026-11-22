@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod cert;
 mod config;
 mod net;
 mod notify;
@@ -53,23 +54,14 @@ fn main() {
         *ctx.tray.borrow_mut() = tray::Tray::new(autostart, auto_copy);
     }
 
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-    {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-
     ui.refresh_list(&ctx.cfg.borrow());
-    restart_network(&ctx, rt.handle());
+    restart_network(&ctx);
 
     // 200ms 一次节拍：轮询托盘点击/菜单事件、同步「移除」按钮状态。
     // 用系统定时器，不再占用 nwg AnimationTimer 的那个 1ms 轮询线程。
     ui.start_tick(200);
 
-    let handlers = bind_handlers(&ui, &ctx, rt.handle().clone());
+    let handlers = bind_handlers(&ui, &ctx);
     // --silent 用于开机自启：只在托盘，不弹窗口
     let silent = std::env::args().any(|a| a == "--silent");
     ui.window.set_visible(!silent);
@@ -103,23 +95,13 @@ fn acquire_single_instance() -> bool {
 
 // ---------------------------------------------------------------- 事件
 
-fn bind_handlers(
-    ui: &Rc<Ui>,
-    ctx: &Rc<Ctx>,
-    rt: tokio::runtime::Handle,
-) -> Vec<nwg::EventHandler> {
+fn bind_handlers(ui: &Rc<Ui>, ctx: &Rc<Ctx>) -> Vec<nwg::EventHandler> {
     let mut handlers = Vec::new();
-    let targets = [
-        ui.window.handle,
-        ui.sub_dlg.handle,
-        ui.set_dlg.handle,
-        ui.pwd_dlg.handle,
-    ];
+    let targets = [ui.window.handle, ui.sub_dlg.handle, ui.set_dlg.handle];
 
     for hwnd in targets {
         let ui = ui.clone();
         let ctx = ctx.clone();
-        let rt = rt.clone();
 
         let handler = nwg::full_bind_event_handler(&hwnd, move |evt, data, handle| {
             match evt {
@@ -131,7 +113,7 @@ fn bind_handlers(
                         let cfg = ctx.cfg.borrow();
                         ui.open_settings(&cfg);
                     } else if handle == ui.btn_remove.handle {
-                        remove_selected(&ui, &ctx, &rt);
+                        remove_selected(&ui, &ctx);
                     } else if handle == ui.sub_link.handle {
                         let current = ui.sub_server.text();
                         ui.set_advanced(true);
@@ -140,32 +122,14 @@ fn bind_handlers(
                             ui.sub_server.set_text(&last);
                         }
                         ui.sub_server.set_focus();
-                    } else if handle == ui.sub_import.handle {
-                        import_pfx(&ui);
-                    } else if handle == ui.sub_clear.handle {
-                        *ui.cert_sel.borrow_mut() = None;
-                        ui.set_cert_display(&None);
                     } else if handle == ui.sub_ok.handle {
-                        commit_subscribe(&ui, &ctx, &rt);
+                        commit_subscribe(&ui, &ctx);
                     } else if handle == ui.sub_cancel.handle {
                         ui.close_subscribe();
                     } else if handle == ui.set_ok.handle {
                         commit_settings(&ui, &ctx);
                     } else if handle == ui.set_cancel.handle {
                         ui.close_settings();
-                    } else if handle == ui.set_cert_rep.handle {
-                        replace_selected_cert(&ui, &ctx, &rt);
-                    } else if handle == ui.set_cert_del.handle {
-                        delete_selected_cert(&ui, &ctx, &rt);
-                    } else if handle == ui.pwd_ok.handle {
-                        ui.finish_password(true);
-                    } else if handle == ui.pwd_cancel.handle {
-                        ui.finish_password(false);
-                    }
-                }
-                nwg::Event::OnListBoxSelect => {
-                    if handle == ui.set_cert_list.handle {
-                        ui.sync_cert_buttons();
                     }
                 }
                 nwg::Event::OnWindowClose => {
@@ -179,9 +143,6 @@ fn bind_handlers(
                         ui.close_subscribe();
                     } else if handle == ui.set_dlg.handle {
                         ui.close_settings();
-                    } else if handle == ui.pwd_dlg.handle {
-                        // 点 X 等于取消：结束模态循环，窗口由 ask_password 收尾
-                        ui.finish_password(false);
                     }
                 }
                 nwg::Event::OnTimerTick => {
@@ -205,11 +166,6 @@ fn bind_handlers(
 fn poll_tray(ui: &Rc<Ui>, ctx: &Rc<Ctx>) {
     // 「移除」只在选中行之后可点，跟着选择状态每 200ms 对一次
     ui.sync_remove_enabled(ctx.cfg.borrow().subscriptions.len());
-
-    // 密码框是模态的：这期间不理托盘点击，免得主窗口翻上来盖住它
-    if ui.pwd_dlg.visible() {
-        return;
-    }
 
     // 左键单击托盘图标 = 打开主窗口
     if tray::left_clicked() {
@@ -317,7 +273,7 @@ fn drain_events(ctx: &Rc<Ctx>) {
 
 // ---------------------------------------------------------------- 订阅
 
-fn commit_subscribe(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
+fn commit_subscribe(ui: &Rc<Ui>, ctx: &Rc<Ctx>) {
     let topic = ui
         .sub_topic
         .text()
@@ -343,10 +299,14 @@ fn commit_subscribe(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
         }
     };
 
-    let cert = if advanced {
-        ui.cert_sel.borrow().clone()
+    let thumb = if advanced {
+        match read_thumb(ui) {
+            Ok(v) => v,
+            // 已经弹过提示了，这次提交作废
+            Err(()) => return,
+        }
     } else {
-        ctx.cfg.borrow().cert_of(&server)
+        ctx.cfg.borrow().cert_thumb_of(&server)
     };
 
     {
@@ -355,7 +315,7 @@ fn commit_subscribe(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
         if advanced {
             let token = ui.sub_token.text();
             cfg.set_token(&server, &token);
-            cfg.set_cert(&server, cert);
+            cfg.set_cert_thumb(&server, thumb);
         } else if !cfg.servers.contains_key(&server) {
             cfg.servers.entry(server.clone()).or_default();
         }
@@ -373,10 +333,10 @@ fn commit_subscribe(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
 
     ui.close_subscribe();
     ui.refresh_list(&ctx.cfg.borrow());
-    restart_network(ctx, rt);
+    restart_network(ctx);
 }
 
-fn remove_selected(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
+fn remove_selected(ui: &Rc<Ui>, ctx: &Rc<Ctx>) {
     let index = {
         let cfg = ctx.cfg.borrow();
         match ui.selected_sub(&cfg) {
@@ -394,201 +354,59 @@ fn remove_selected(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
     }
 
     ui.refresh_list(&ctx.cfg.borrow());
-    restart_network(ctx, rt);
+    restart_network(ctx);
 }
 
-// ---------------------------------------------------------------- 证书
+// ---------------------------------------------------------------- 证书指纹
 
-/// 选一个 pfx/p12 文件，取消返回 None
-fn pick_pfx(parent: &nwg::Window) -> Option<String> {
-    let mut dialog = nwg::FileDialog::default();
-    // nwg 的 filters 不是 Win32 那套 "描述|通配符"，它按 '|' 切成若干段，
-    // 每段必须写成 "描述(通配符)" 的形式，少一个括号就直接 build 失败。
-    if nwg::FileDialog::builder()
-        .title("选择客户端证书")
-        .action(nwg::FileDialogAction::Open)
-        .filters("PKCS#12 证书(*.pfx;*.p12)|所有文件(*.*)")
-        .build(&mut dialog)
-        .is_err()
-    {
-        notify::message("无法打开文件选择窗口。", "导入失败");
-        return None;
+/// 读订阅对话框里的指纹输入框并校验。
+/// 返回 `Err(())` 表示已经弹过提示、调用方应当整个放弃这次提交。
+fn read_thumb(ui: &Rc<Ui>) -> Result<Option<String>, ()> {
+    let raw = ui.sub_thumb.text();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
     }
 
-    if !dialog.run(Some(parent)) {
-        return None;
-    }
-    dialog
-        .get_selected_item()
-        .ok()
-        .map(|i| i.to_string_lossy().to_string())
-}
-
-/// 用 native-tls 先验一遍：密码错或文件坏了直接拒绝，不要存进去。
-/// Windows 上最终调的是 crypt32 的 PFXImportCertStore，错误码能区分
-/// 「密码错」「不含私钥」「格式不认识」，不给出来就只能是「打不开」这种没用的提示。
-fn check_pfx(bytes: &[u8], password: &str) -> Result<(), String> {
-    let Err(e) = native_tls::Identity::from_pkcs12(bytes, password) else {
-        return Ok(());
-    };
-    let detail = format!("{e}");
-    let hint = if detail.contains("0x80070056") || detail.to_lowercase().contains("password") {
-        "密码不对。"
-    } else if detail.contains("0x8009310b") || detail.contains("0x80093102") {
-        "Windows 认不出这个 pfx 的编码格式，重新导出一次试试。"
-    } else {
-        "可能是密码不对，或者导出时没有勾「包含私钥」。"
-    };
-    Err(format!(
-        "这个 pfx 打不开。{hint}\n\n\
-         请在 certmgr 里重新导出一次，务必勾上「包含私钥」，\n\
-         加密方式选「AES-256-SHA256」或「TripleDES-SHA1」都可以。\n\n\
-         原始错误：{detail}"
-    ))
-}
-
-fn pfx_label(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("cert")
-        .to_string()
-}
-
-/// 订阅对话框里的「导入 pfx...」：选文件 → 弹密码框 → 校验 → 存进 certs/
-fn import_pfx(ui: &Rc<Ui>) {
-    let Some(path) = pick_pfx(&ui.sub_dlg) else {
-        return;
-    };
-    let Ok(bytes) = std::fs::read(&path) else {
-        notify::message(&format!("读不到这个文件：\n{path}"), "导入失败");
-        return;
+    let Some(thumb) = cert::normalize(raw) else {
+        notify::message(
+            "指纹应该是 40 位十六进制（certmgr 证书详情里那串，可以带空格）。\n\n\
+             在 certmgr 里双击证书 →「详细信息」→「指纹」，复制过来就行。",
+            "指纹格式不对",
+        );
+        ui.sub_thumb.set_focus();
+        return Err(());
     };
 
-    // 密码错允许重输两次，省得重新选一遍文件
-    for _ in 0..3 {
-        let Some(password) = ui.ask_password(
-            &ui.sub_dlg,
-            "导入客户端证书",
-            "输入这张 pfx 的密码（导出证书时设定的）",
-        ) else {
-            return;
-        };
-        match check_pfx(&bytes, &password) {
-            Ok(()) => {
-                match config::save_cert(&bytes, &password, &pfx_label(&path)) {
-                    Some(id) => {
-                        *ui.cert_sel.borrow_mut() = Some(id.clone());
-                        ui.set_cert_display(&Some(id));
-                        ui.refresh_certs();
-                    }
-                    None => notify::message("证书保存失败：写不进配置目录。", "导入失败"),
-                }
-                return;
-            }
-            Err(reason) => notify::message(&reason, "导入失败"),
-        }
-    }
-}
-
-/// 设置页的「替换」：只换掉证书文件本身，id 和显示名都不动。
-/// 引用它的服务器不用改配置，但必须重连才会用上新证书。
-fn replace_selected_cert(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
-    let Some(id) = ui.selected_cert_id() else {
-        return;
-    };
-    let Some(path) = pick_pfx(&ui.set_dlg) else {
-        return;
-    };
-    let Ok(bytes) = std::fs::read(&path) else {
-        notify::message(&format!("读不到这个文件：\n{path}"), "替换失败");
-        return;
+    let Some(found) = cert::find(&thumb) else {
+        notify::message(
+            &format!(
+                "系统证书库里找不到指纹为\n{thumb}\n的证书。\n\n\
+                 请确认三件事：\n\
+                 1. 证书装在「当前用户 → 个人 → 证书」或「本地计算机 → 个人 → 证书」里；\n\
+                 2. 指纹没有抄错位（40 位，只认十六进制字符）；\n\
+                 3. 这是本机申请或导入时带了私钥的证书。"
+            ),
+            "找不到证书",
+        );
+        ui.sub_thumb.set_focus();
+        return Err(());
     };
 
-    for _ in 0..3 {
-        let Some(password) = ui.ask_password(
-            &ui.set_dlg,
-            "替换客户端证书",
-            "输入新 pfx 的密码（导出证书时设定的）",
-        ) else {
-            return;
-        };
-        match check_pfx(&bytes, &password) {
-            Ok(()) => {
-                if !config::overwrite_cert(&id, &bytes, &password) {
-                    notify::message("替换失败：写不进证书文件。", "替换失败");
-                    return;
-                }
-                ui.refresh_certs();
-                ui.select_cert(&id);
-                restart_network(ctx, rt);
-                return;
-            }
-            Err(reason) => notify::message(&reason, "替换失败"),
-        }
-    }
-}
-
-
-/// 删除设置页里选中的证书。引用它的服务器会一并改成「不使用证书」，
-/// 否则那条订阅会指向一个已经删掉的文件，重连时报错。
-fn delete_selected_cert(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
-    let Some(id) = ui.selected_cert_id() else {
-        return;
-    };
-
-    let label = config::list_certs()
-        .into_iter()
-        .find(|c| c.id == id)
-        .map(|c| c.label)
-        .unwrap_or_else(|| id.clone());
-
-    let users: Vec<String> = ctx
-        .cfg
-        .borrow()
-        .servers
-        .iter()
-        .filter(|(_, s)| s.cert_id.as_deref() == Some(id.as_str()))
-        .map(|(addr, _)| addr.clone())
-        .collect();
-
-    let mut ask = format!("删除证书「{label}」？\n\n这个文件会被永久删除。");
-    if !users.is_empty() {
-        ask.push_str("\n\n下面这些服务器会改为不使用客户端证书：");
-        for addr in &users {
-            ask.push_str(&format!("\n  {addr}"));
-        }
-    }
-    if !notify::confirm(&ask, "删除证书") {
-        return;
+    if !cert::has_private_key(&found) {
+        notify::message(
+            &format!(
+                "证书 {} 没有可用的私钥，做不了客户端认证。\n\n\
+                 私钥可能没跟着证书一起导入，或者被标记为不可导出。",
+                cert::describe(&found)
+            ),
+            "证书没有私钥",
+        );
+        ui.sub_thumb.set_focus();
+        return Err(());
     }
 
-    if !config::delete_cert(&id) {
-        notify::message("删不掉这个文件，可能被占用或没有写权限。", "删除失败");
-        return;
-    }
-
-    let changed = {
-        let mut cfg = ctx.cfg.borrow_mut();
-        let n = cfg.drop_cert_refs(&id);
-        if n > 0 {
-            let _ = cfg.save();
-        }
-        n
-    };
-
-    // 订阅对话框里如果正指着这张证书，也清掉，免得下次点「确定」又把它写回去
-    let pointing = ui.cert_sel.borrow().as_deref() == Some(id.as_str());
-    if pointing {
-        *ui.cert_sel.borrow_mut() = None;
-        ui.set_cert_display(&None);
-    }
-
-    ui.refresh_certs();
-
-    if changed > 0 {
-        restart_network(ctx, rt);
-    }
+    Ok(Some(thumb))
 }
 
 fn commit_settings(ui: &Rc<Ui>, ctx: &Rc<Ctx>) {
@@ -611,13 +429,22 @@ fn commit_settings(ui: &Rc<Ui>, ctx: &Rc<Ctx>) {
 
 // ---------------------------------------------------------------- 连接调度
 
-fn restart_network(ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
+fn restart_network(ctx: &Rc<Ctx>) {
+    // 先让旧线程收手：置位后它们会在下一次检查时退出。
+    // 不强求 join —— 阻塞在 read 上的线程最多 90 秒才醒，等它会把界面卡住。
     {
-        let mut tasks = ctx.tasks.lock().unwrap();
-        for task in tasks.drain(..) {
-            task.abort();
+        let mut stops = ctx.stops.lock().unwrap();
+        for stop in stops.drain(..) {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
+
+    // 换一代：旧线程晚到的事件靠代次号丢掉，免得把新连接的状态覆盖成旧的
+    let generation = ctx
+        .generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
+
     // 配置改了就要重新给一次提示的机会
     FAIL_REPORTED.store(false, std::sync::atomic::Ordering::SeqCst);
 
@@ -633,36 +460,42 @@ fn restart_network(ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
     }
 
     for (server, topics) in by_server {
-        let (token, identity, cert_err) = {
+        let (token, thumb, cert_err) = {
             let cfg = ctx.cfg.borrow();
             let token = cfg.token(&server);
             let mut err = None;
-            let identity = match cfg.cert_of(&server) {
-                Some(id) => match config::load_cert(&id) {
-                    Some((pfx, pwd)) => match native_tls::Identity::from_pkcs12(&pfx, &pwd) {
-                        Ok(id) => Some(id),
-                        Err(e) => {
+            // 配置里只有指纹，这里把它换成证书库里的实际证书再验一遍。
+            // 用户可能已经把证书从证书库里删了，那种情况不该硬连。
+            let thumb = match cfg.cert_thumb_of(&server) {
+                Some(t) => match cert::find(&t) {
+                    Some(c) => {
+                        if !cert::has_private_key(&c) {
                             err = Some(format!(
-                                "{server} 的客户端证书加载失败：{e}\n\
-                                 证书文件或密码可能坏了，请重新导入一次 pfx。"
+                                "{server} 的客户端证书没有可用私钥，无法做客户端认证。\n\
+                                 证书：{}\n指纹：{t}\n\n\
+                                 请把带私钥的证书重新装进「个人」证书库。",
+                                cert::describe(&c)
                             ));
                             None
+                        } else {
+                            Some(t)
                         }
-                    },
+                    }
                     None => {
                         err = Some(format!(
-                            "{server} 的客户端证书文件读不出来（DPAPI 解密失败或文件被删）。\n\
-                             请到订阅窗口重新导入 pfx。"
+                            "{server} 用的客户端证书在系统证书库里找不到了。\n\
+                             指纹：{t}\n\n\
+                             请在订阅窗口重新填一次指纹，或者把证书装回「个人」证书库。"
                         ));
                         None
                     }
                 },
                 None => None,
             };
-            (token, identity, err)
+            (token, thumb, err)
         };
 
-        // 证书都没加载上就别连了，连上去也只会得到 403，
+        // 证书没准备好就别连了，连上去也只会得到 403，
         // 那样还得去猜是令牌错还是证书错
         if let Some(detail) = cert_err {
             ctx.events.lock().unwrap().push_back(NetEvent::State {
@@ -674,15 +507,28 @@ fn restart_network(ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
             continue;
         }
 
-        let task = net::spawn_server(rt, server, token, topics, identity, make_sink(ctx));
-        ctx.tasks.lock().unwrap().push(task);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        ctx.stops.lock().unwrap().push(stop.clone());
+        net::spawn_server(
+            server,
+            token,
+            thumb,
+            topics,
+            make_sink(ctx, generation),
+            stop,
+        );
     }
 }
 
-fn make_sink(ctx: &Rc<Ctx>) -> net::Sink {
+fn make_sink(ctx: &Rc<Ctx>, generation: u64) -> net::Sink {
     let events = ctx.events.clone();
     let notice = ctx.notice;
+    let live = ctx.generation.clone();
     std::sync::Arc::new(move |event: NetEvent| {
+        // 上一代连接残留的线程还会吐几条事件，直接丢
+        if live.load(std::sync::atomic::Ordering::SeqCst) != generation {
+            return;
+        }
         events.lock().unwrap().push_back(event);
         notice.notice();
     })

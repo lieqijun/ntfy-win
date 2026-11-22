@@ -1,4 +1,5 @@
-//! 配置、DPAPI 加解密、证书文件、开机自启。
+//! 配置、DPAPI 加解密、开机自启。
+//! 客户端证书不进配置文件，只存一个指纹，私钥始终留在系统证书库里。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -31,9 +32,9 @@ pub struct ServerCfg {
     /// DPAPI 加密后的 token（base64），空串表示没有 token
     #[serde(default)]
     pub token_enc: String,
-    /// certs/ 下的文件名（不含扩展名），None 表示不使用客户端证书
+    /// 客户端证书的 SHA-1 指纹（40 位大写十六进制），None 表示不使用客户端证书
     #[serde(default)]
-    pub cert_id: Option<String>,
+    pub cert_thumb: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,12 +98,6 @@ pub fn config_path() -> PathBuf {
     data_dir().join("config.json")
 }
 
-pub fn certs_dir() -> PathBuf {
-    let d = data_dir().join("certs");
-    let _ = fs::create_dir_all(&d);
-    d
-}
-
 // ---------------------------------------------------------------- 配置读写
 
 impl Config {
@@ -144,26 +139,13 @@ impl Config {
         }
     }
 
-    pub fn set_cert(&mut self, server: &str, cert_id: Option<String>) {
+    pub fn set_cert_thumb(&mut self, server: &str, thumb: Option<String>) {
         let entry = self.servers.entry(server.to_string()).or_default();
-        entry.cert_id = cert_id;
+        entry.cert_thumb = thumb;
     }
 
-    pub fn cert_of(&self, server: &str) -> Option<String> {
-        self.servers.get(server).and_then(|s| s.cert_id.clone())
-    }
-
-    /// 把引用这张证书的服务器全部改成「不使用证书」，返回改动了几处。
-    /// 删证书文件之前必须先调这个，否则服务器会指向一个不存在的文件。
-    pub fn drop_cert_refs(&mut self, id: &str) -> usize {
-        let mut hit = 0;
-        for server in self.servers.values_mut() {
-            if server.cert_id.as_deref() == Some(id) {
-                server.cert_id = None;
-                hit += 1;
-            }
-        }
-        hit
+    pub fn cert_thumb_of(&self, server: &str) -> Option<String> {
+        self.servers.get(server).and_then(|s| s.cert_thumb.clone())
     }
 }
 
@@ -249,91 +231,6 @@ pub fn protect(data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(not(windows))]
 pub fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
     Some(data.to_vec())
-}
-
-// ---------------------------------------------------------------- 证书文件
-
-#[derive(Serialize, Deserialize)]
-struct CertBlob {
-    pfx: String,
-    password: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct CertInfo {
-    pub id: String,
-    pub label: String,
-}
-
-/// 导入 pfx：整体 DPAPI 加密后写 certs/<id>.bin
-pub fn save_cert(pfx: &[u8], password: &str, label: &str) -> Option<String> {
-    let id = format!(
-        "{:x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let blob = CertBlob { pfx: b64_encode(pfx), password: password.to_string() };
-    let json = serde_json::to_vec(&blob).ok()?;
-    let enc = protect(&json)?;
-    let _ = fs::write(certs_dir().join(format!("{id}.bin")), enc);
-    // 记录一个可读名字，仅用于下拉显示
-    let _ = fs::write(certs_dir().join(format!("{id}.name")), label.as_bytes());
-    Some(id)
-}
-
-/// 用同一 id 覆盖已存证书（替换文件，id 和显示名都保留）。
-/// 引用这张证书的服务器不用改配置，但必须重启连接才会用上新证书。
-pub fn overwrite_cert(id: &str, pfx: &[u8], password: &str) -> bool {
-    let blob = CertBlob { pfx: b64_encode(pfx), password: password.to_string() };
-    let Ok(json) = serde_json::to_vec(&blob) else {
-        return false;
-    };
-    let Some(enc) = protect(&json) else {
-        return false;
-    };
-    fs::write(certs_dir().join(format!("{id}.bin")), enc).is_ok()
-}
-
-pub fn load_cert(id: &str) -> Option<(Vec<u8>, String)> {
-    let raw = fs::read(certs_dir().join(format!("{id}.bin"))).ok()?;
-    let json = unprotect(&raw)?;
-    let blob: CertBlob = serde_json::from_slice(&json).ok()?;
-    Some((b64_decode(&blob.pfx)?, blob.password))
-}
-
-/// 删掉 certs/<id>.bin 和同名的 .name。返回 .bin 是否真的删掉了。
-pub fn delete_cert(id: &str) -> bool {
-    let dir = certs_dir();
-    let ok = fs::remove_file(dir.join(format!("{id}.bin"))).is_ok();
-    let _ = fs::remove_file(dir.join(format!("{id}.name")));
-    ok
-}
-
-pub fn list_certs() -> Vec<CertInfo> {
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(certs_dir()) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("bin") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let id = stem.to_string();
-        let label = fs::read_to_string(certs_dir().join(format!("{id}.name")))
-            .map(|s| s.trim().to_string())
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| id.clone());
-        out.push(CertInfo { id, label });
-    }
-    out.sort_by(|a, b| a.label.cmp(&b.label));
-    out
 }
 
 // ---------------------------------------------------------------- 开机自启
