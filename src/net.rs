@@ -29,8 +29,10 @@ pub enum ConnState {
 #[derive(Clone, Debug)]
 pub enum NetEvent {
     Message { topic: String, title: String, body: String },
-    /// detail 在失败时带具体原因，成功时为空
-    State { server: String, state: ConnState, detail: String },
+    /// detail 在失败时带具体原因，成功时为空。
+    /// first = true 表示「这条连接压根没连通过」，只有这种失败才值得弹框打扰人；
+    /// 连上过之后的掉线属于正常重连，只更新托盘提示。
+    State { server: String, state: ConnState, detail: String, first: bool },
 }
 
 pub type Sink = Arc<dyn Fn(NetEvent) + Send + Sync>;
@@ -116,6 +118,8 @@ pub fn spawn_server(
         let last_seen: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
         // 本轮是否真的订阅成功过，用来决定要不要把退避重置
         let reached = Arc::new(AtomicBool::new(false));
+        // 这条服务器有没有「连通过」。连通过之后再掉线只是重连，不该再弹框。
+        let mut ever_connected = false;
 
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -137,6 +141,7 @@ pub fn spawn_server(
             // 连上过又断了，说明网络是通的，退避从头算，不要一直卡在 60 秒
             if reached.load(Ordering::Relaxed) {
                 backoff = 1;
+                ever_connected = true;
             }
 
             match outcome {
@@ -148,6 +153,8 @@ pub fn spawn_server(
                         server: server.clone(),
                         state: ConnState::AuthFailed,
                         detail,
+                        // 认证/端点错通常要人动手改配置，照旧弹一次
+                        first: true,
                     });
                     return;
                 }
@@ -159,6 +166,7 @@ pub fn spawn_server(
                         server: server.clone(),
                         state: ConnState::Disconnected,
                         detail,
+                        first: !ever_connected,
                     });
                 }
             }
@@ -240,7 +248,7 @@ fn connect_once(
     };
 
     let _ = tcp.set_nodelay(true);
-    // 握手阶段用短超时，连上之后再把读超时放宽到 90 秒（见下）
+    // 握手阶段用短超时，握手完成后按下面的说明重设（见「空闲不算断开」那段）
     let _ = tcp.set_read_timeout(Some(Duration::from_secs(15)));
     let _ = tcp.set_write_timeout(Some(Duration::from_secs(15)));
     // 留一份句柄：TlsStream 拿走所有权后还能改超时
@@ -303,7 +311,10 @@ fn connect_once(
                 headers.insert("authorization", v);
             }
         }
-        headers.insert("user-agent", HeaderValue::from_static("ntfy-win/2.0"));
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static(concat!("ntfy-win/", env!("CARGO_PKG_VERSION"))),
+        );
     }
 
     let config = WebSocketConfig {
@@ -321,11 +332,23 @@ fn connect_once(
         }
     };
 
-    // ntfy 的 WebSocket 上服务器会定时发 ping（默认 45 秒），正常连接不会真的安静 90 秒。
-    // 读超时只用来兜住死链：底层 socket 一超时就说明这条连接已经没救了。
+    // ntfy 的 WebSocket 是单向推送：订阅一个安静的主题时，服务器可以十几分钟
+    // 一个字节都不发（它的 keepalive 是否发 ping 取决于版本和配置）。所以
+    // 「安静」绝对不能当成「断开」——2.0.0 就是拿 90 秒静默当死亡，结果空闲
+    // 连接每分半被自己掐一次，托盘刚变蓝又弹「无法连接」。
+    //
+    // 判断真死链交给 TCP keepalive：下面给 socket 开了 30 秒探测 + 10 秒间隔，
+    // 对端真没了会在 1 分钟内以 RST 形式报上来，read 直接返回错误。
+    // 读超时缩到 20 秒，只是为了让线程定期醒一下（好及时看到停止标志），
+    // 醒来没数据就继续等，不算失败。
     if let Some(c) = &ctl {
-        let _ = c.set_read_timeout(Some(Duration::from_secs(90)));
+        let _ = c.set_read_timeout(Some(Duration::from_secs(20)));
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10));
+        let _ = socket2::SockRef::from(c).set_tcp_keepalive(&keepalive);
     }
+    let settled_at = std::time::Instant::now();
 
     // 连上不等于订阅成功：ntfy 会先回一帧 {"event":"open","topic":"..."}。
     // 等不到这一帧就说明主题没订上，不能算连接成功。
@@ -339,14 +362,15 @@ fn connect_once(
             Ok(m) => m,
             Err(e) => {
                 if is_timeout(&e) {
-                    return Outcome::Lost(if announced {
-                        "90 秒没收到任何数据，判定连接已死。".to_string()
-                    } else {
-                        format!(
-                            "连上了，但 90 秒内没收到 ntfy 的 open 事件。\n\
+                    // 空闲连接：没消息就是没帧，接着等。
+                    // 只有「握手成功但一直等不到 open 事件」才说明订阅没成功。
+                    if !announced && settled_at.elapsed() >= Duration::from_secs(60) {
+                        return Outcome::Lost(format!(
+                            "连上了，但一分钟内没收到 ntfy 的 open 事件。\n\
                              端点：{url}\n主题是否拼错？服务器是否支持 WebSocket？"
-                        )
-                    });
+                        ));
+                    }
+                    continue;
                 }
                 let raw = format!("{e}");
                 let detail = describe(&raw, &url);
@@ -397,6 +421,7 @@ fn take_open(
         server: server.to_string(),
         state: ConnState::Connected,
         detail: String::new(),
+        first: false,
     });
 }
 
@@ -437,7 +462,8 @@ fn handle_frame(text: &str, last_seen: &Arc<Mutex<Option<i64>>>, sink: &Sink) {
     sink(NetEvent::Message { topic: topic_name, title, body });
 }
 
-/// 底层 socket 的读超时，说明 90 秒没数据了
+/// 底层 socket 的读超时。这**不**代表连接死了（见 connect_once 里的说明），
+/// 只说明这段时间一个字节都没来。
 fn is_timeout(err: &tungstenite::Error) -> bool {
     if let tungstenite::Error::Io(e) = err {
         return matches!(

@@ -1,6 +1,6 @@
 [package]
 name = "ntfy-win"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 description = "Minimal ntfy push client that lives in the Windows tray"
 license = "MIT"
@@ -13,6 +13,8 @@ tauri-winrt-notification = "0.2"
 # 阻塞版 websocket + schannel：证书从系统证书库按指纹取，不再解析 pfx
 tungstenite = "0.24"
 schannel = "0.1.30"
+# 只用来给 socket 开 TCP keepalive：死链交给系统探测，不靠自己数静默时长
+socket2 = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"

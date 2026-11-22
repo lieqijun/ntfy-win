@@ -232,7 +232,7 @@ fn drain_events(ctx: &Rc<Ctx>) {
                     notify::copy_to_clipboard(&body);
                 }
             }
-            NetEvent::State { state, detail, .. } => {
+            NetEvent::State { state, detail, first, .. } => {
                 let connected = state == ConnState::Connected;
                 let tip = match state {
                     ConnState::Connected => "ntfy · 已连接".to_string(),
@@ -249,9 +249,10 @@ fn drain_events(ctx: &Rc<Ctx>) {
                     }
                 }
 
-                // 连不上时只弹一次框，把完整原因摊开给人看。
-                // 之后靠托盘 tooltip，不重复打扰。
-                if state != ConnState::Connected && !detail.is_empty() {
+                // 只有「压根没连通过」的失败才弹框。连上之后再掉线属于正常重连，
+                // 只更新托盘提示——否则网络抖一下就在脸上糊一个「无法连接」，
+                // 而托盘图标明明是蓝的。
+                if state != ConnState::Connected && first && !detail.is_empty() {
                     if !FAIL_REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
                         notify::message(
                             &format!(
@@ -431,7 +432,7 @@ fn commit_settings(ui: &Rc<Ui>, ctx: &Rc<Ctx>) {
 
 fn restart_network(ctx: &Rc<Ctx>) {
     // 先让旧线程收手：置位后它们会在下一次检查时退出。
-    // 不强求 join —— 阻塞在 read 上的线程最多 90 秒才醒，等它会把界面卡住。
+    // 不强求 join —— 阻塞在 read 上的线程最多 20 秒才醒，等它会把界面卡住。
     {
         let mut stops = ctx.stops.lock().unwrap();
         for stop in stops.drain(..) {
@@ -502,6 +503,7 @@ fn restart_network(ctx: &Rc<Ctx>) {
                 server,
                 state: ConnState::AuthFailed,
                 detail,
+                first: true,
             });
             ctx.notice.notice();
             continue;

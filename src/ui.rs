@@ -161,7 +161,7 @@ const SUB_H_ADVANCED: i32 = 222;
 const SUB_BTN_Y_BASIC: i32 = 124;
 const SUB_BTN_Y_ADVANCED: i32 = 186;
 
-const SET_H: i32 = 140;
+const SET_H: i32 = 192;
 
 impl Ui {
     pub fn build() -> Result<(Ui, Ctx), nwg::NwgError> {
@@ -394,7 +394,7 @@ impl Ui {
         nwg::CheckBox::builder()
             .parent(&set_dlg)
             .text("开机自启到托盘（登录后静默启动）")
-            .position((s(16), s(26)))
+            .position((s(16), s(24)))
             .size((s(340), s(24)))
             .build(&mut set_autostart)?;
 
@@ -402,7 +402,7 @@ impl Ui {
         nwg::CheckBox::builder()
             .parent(&set_dlg)
             .text("通知内容自动复制到剪贴板")
-            .position((s(16), s(58)))
+            .position((s(16), s(56)))
             .size((s(340), s(24)))
             .build(&mut set_copy)?;
 
@@ -411,14 +411,14 @@ impl Ui {
             .parent(&set_dlg)
             .text("客户端证书从 Windows 证书库读取，订阅时填写证书指纹。")
             .position((s(16), s(92)))
-            .size((s(348), s(18)))
+            .size((s(348), s(34)))
             .build(&mut set_note)?;
 
         let mut set_ok = nwg::Button::default();
         nwg::Button::builder()
             .parent(&set_dlg)
             .text("确定")
-            .position((s(190), s(96)))
+            .position((s(190), s(138)))
             .size((s(BTN_W), s(BTN_H)))
             .build(&mut set_ok)?;
 
@@ -426,7 +426,7 @@ impl Ui {
         nwg::Button::builder()
             .parent(&set_dlg)
             .text("取消")
-            .position((s(284), s(96)))
+            .position((s(284), s(138)))
             .size((s(BTN_W), s(BTN_H)))
             .build(&mut set_cancel)?;
 
