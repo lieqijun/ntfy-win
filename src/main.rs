@@ -351,10 +351,12 @@ fn import_pfx(ui: &Rc<Ui>) {
     }
 
     let mut dialog = nwg::FileDialog::default();
+    // nwg 的 filters 不是 Win32 那套 "描述|通配符"，它按 '|' 切成若干段，
+    // 每段必须写成 "描述(通配符)" 的形式，少一个括号就直接 build 失败。
     if nwg::FileDialog::builder()
-        .title("选择客户端证书（.pfx / .p12）")
+        .title("选择客户端证书")
         .action(nwg::FileDialogAction::Open)
-        .filters("PKCS#12(*.pfx;*.p12)|*.pfx;*.p12")
+        .filters("PKCS#12 证书(*.pfx;*.p12)|所有文件(*.*)")
         .build(&mut dialog)
         .is_err()
     {

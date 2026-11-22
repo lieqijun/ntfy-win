@@ -43,18 +43,18 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/x86_64-pc-windows-msvc/release/ntfy-win.exe dist/
-          Compress-Archive -Path dist/* -DestinationPath "ntfy-win-${{ steps.ver.outputs.tag }}-x64.zip"
+          Compress-Archive -Path dist/* -DestinationPath "ntfy-win-x64.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ntfy-win-${{ steps.ver.outputs.tag }}
-          path: ntfy-win-${{ steps.ver.outputs.tag }}-x64.zip
+          name: ntfy-win-x64
+          path: ntfy-win-x64.zip
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: ${{ steps.ver.outputs.tag }}
-          files: ntfy-win-${{ steps.ver.outputs.tag }}-x64.zip
+          files: ntfy-win-x64.zip
           generate_release_notes: true
