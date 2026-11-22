@@ -148,6 +148,13 @@ fn bind_handlers(
                         commit_settings(&ui, &ctx);
                     } else if handle == ui.set_cancel.handle {
                         ui.close_settings();
+                    } else if handle == ui.set_cert_del.handle {
+                        delete_selected_cert(&ui, &ctx, &rt);
+                    }
+                }
+                nwg::Event::OnListBoxSelect => {
+                    if handle == ui.set_cert_list.handle {
+                        ui.sync_cert_del();
                     }
                 }
                 nwg::Event::OnWindowClose => {
@@ -449,6 +456,67 @@ fn import_pfx(ui: &Rc<Ui>) {
             ui.set_cert_display(&Some(id));
         }
         None => notify::message("证书保存失败：写不进配置目录。", "导入失败"),
+    }
+}
+
+/// 删除设置页里选中的证书。引用它的服务器会一并改成「不使用证书」，
+/// 否则那条订阅会指向一个已经删掉的文件，重连时报错。
+fn delete_selected_cert(ui: &Rc<Ui>, ctx: &Rc<Ctx>, rt: &tokio::runtime::Handle) {
+    let Some(id) = ui.selected_cert_id() else {
+        return;
+    };
+
+    let label = config::list_certs()
+        .into_iter()
+        .find(|c| c.id == id)
+        .map(|c| c.label)
+        .unwrap_or_else(|| id.clone());
+
+    let users: Vec<String> = ctx
+        .cfg
+        .borrow()
+        .servers
+        .iter()
+        .filter(|(_, s)| s.cert_id.as_deref() == Some(id.as_str()))
+        .map(|(addr, _)| addr.clone())
+        .collect();
+
+    let mut ask = format!("删除证书「{label}」？\n\n这个文件会被永久删除。");
+    if !users.is_empty() {
+        ask.push_str("\n\n下面这些服务器会改为不使用客户端证书：");
+        for addr in &users {
+            ask.push_str(&format!("\n  {addr}"));
+        }
+    }
+    if !notify::confirm(&ask, "删除证书") {
+        return;
+    }
+
+    if !config::delete_cert(&id) {
+        notify::message("删不掉这个文件，可能被占用或没有写权限。", "删除失败");
+        return;
+    }
+
+    let changed = {
+        let mut cfg = ctx.cfg.borrow_mut();
+        let n = cfg.drop_cert_refs(&id);
+        if n > 0 {
+            let _ = cfg.save();
+        }
+        n
+    };
+
+    // 订阅对话框里如果正指着这张证书，也清掉，免得下次点「确定」又把它写回去
+    let pointing = ui.cert_sel.borrow().as_deref() == Some(id.as_str());
+    if pointing {
+        *ui.cert_sel.borrow_mut() = None;
+        ui.set_cert_display(&None);
+    }
+
+    ui.refresh_certs();
+
+    if changed > 0 {
+        restart_network(ctx, rt);
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "ntfy-win"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Minimal ntfy push client that lives in the Windows tray"
 license = "MIT"

@@ -128,6 +128,10 @@ pub struct Ui {
     pub set_dlg: nwg::Window,
     pub set_autostart: nwg::CheckBox,
     pub set_copy: nwg::CheckBox,
+    pub set_cert_title: nwg::Label,
+    pub set_cert_list: nwg::ListBox<String>,
+    pub set_cert_del: nwg::Button,
+    pub set_cert_hint: nwg::Label,
     pub set_ok: nwg::Button,
     pub set_cancel: nwg::Button,
 
@@ -162,7 +166,7 @@ const SUB_H_ADVANCED: i32 = 236;
 const SUB_BTN_Y_BASIC: i32 = 124;
 const SUB_BTN_Y_ADVANCED: i32 = 196;
 
-const SET_H: i32 = 140;
+const SET_H: i32 = 262;
 
 impl Ui {
     pub fn build() -> Result<(Ui, Ctx), nwg::NwgError> {
@@ -432,11 +436,44 @@ impl Ui {
             .size((s(340), s(24)))
             .build(&mut set_copy)?;
 
+        let mut set_cert_title = nwg::Label::default();
+        nwg::Label::builder()
+            .parent(&set_dlg)
+            .text("已保存的客户端证书")
+            .position((s(16), s(92)))
+            .size((s(200), s(18)))
+            .build(&mut set_cert_title)?;
+
+        let mut set_cert_list: nwg::ListBox<String> = nwg::ListBox::default();
+        nwg::ListBox::<String>::builder()
+            .parent(&set_dlg)
+            .position((s(16), s(112)))
+            .size((s(266), s(84)))
+            .flags(nwg::ListBoxFlags::VISIBLE | nwg::ListBoxFlags::TAB_STOP)
+            .build(&mut set_cert_list)?;
+
+        let mut set_cert_del = nwg::Button::default();
+        nwg::Button::builder()
+            .parent(&set_dlg)
+            .text("删除")
+            .position((s(292), s(112)))
+            .size((s(72), s(26)))
+            .build(&mut set_cert_del)?;
+        set_cert_del.set_enabled(false);
+
+        let mut set_cert_hint = nwg::Label::default();
+        nwg::Label::builder()
+            .parent(&set_dlg)
+            .text("删除后，引用它的服务器会改为不使用证书。")
+            .position((s(16), s(200)))
+            .size((s(348), s(18)))
+            .build(&mut set_cert_hint)?;
+
         let mut set_ok = nwg::Button::default();
         nwg::Button::builder()
             .parent(&set_dlg)
             .text("确定")
-            .position((s(190), s(96)))
+            .position((s(190), s(226)))
             .size((s(BTN_W), s(BTN_H)))
             .build(&mut set_ok)?;
 
@@ -444,7 +481,7 @@ impl Ui {
         nwg::Button::builder()
             .parent(&set_dlg)
             .text("取消")
-            .position((s(284), s(96)))
+            .position((s(284), s(226)))
             .size((s(BTN_W), s(BTN_H)))
             .build(&mut set_cancel)?;
 
@@ -474,6 +511,10 @@ impl Ui {
             set_dlg,
             set_autostart,
             set_copy,
+            set_cert_title,
+            set_cert_list,
+            set_cert_del,
+            set_cert_hint,
             set_ok,
             set_cancel,
             cert_sel: Rc::new(RefCell::new(None)),
@@ -607,6 +648,7 @@ impl Ui {
         } else {
             nwg::CheckBoxState::Unchecked
         });
+        self.refresh_certs();
         center_on(&self.window, &self.set_dlg);
         self.set_dlg.set_visible(true);
         self.window.set_enabled(false);
@@ -616,6 +658,31 @@ impl Ui {
         self.set_dlg.set_visible(false);
         self.window.set_enabled(true);
         self.bring_to_front();
+    }
+
+    /// 设置页里重新列出 certs/ 下已存的证书。
+    /// 列表顺序和 config::list_certs() 一致，所以选中行的下标可以直接当索引用。
+    pub fn refresh_certs(&self) {
+        let items: Vec<String> = config::list_certs()
+            .into_iter()
+            .map(|c| {
+                let short: String = c.id.chars().take(8).collect();
+                format!("{}（{}）", c.label, short)
+            })
+            .collect();
+        let _ = self.set_cert_list.set_collection(items);
+        self.set_cert_del.set_enabled(false);
+    }
+
+    pub fn selected_cert_id(&self) -> Option<String> {
+        let index = self.set_cert_list.selection()?;
+        config::list_certs().get(index).map(|c| c.id.clone())
+    }
+
+    /// 选中项变化时同步「删除」按钮的可用状态
+    pub fn sync_cert_del(&self) {
+        self.set_cert_del
+            .set_enabled(self.set_cert_list.selection().is_some());
     }
 
     /// 关闭子对话框后把主窗口拉回前台，否则它会掉到别的窗口后面

@@ -152,6 +152,19 @@ impl Config {
     pub fn cert_of(&self, server: &str) -> Option<String> {
         self.servers.get(server).and_then(|s| s.cert_id.clone())
     }
+
+    /// 把引用这张证书的服务器全部改成「不使用证书」，返回改动了几处。
+    /// 删证书文件之前必须先调这个，否则服务器会指向一个不存在的文件。
+    pub fn drop_cert_refs(&mut self, id: &str) -> usize {
+        let mut hit = 0;
+        for server in self.servers.values_mut() {
+            if server.cert_id.as_deref() == Some(id) {
+                server.cert_id = None;
+                hit += 1;
+            }
+        }
+        hit
+    }
 }
 
 // ---------------------------------------------------------------- base64
@@ -275,6 +288,14 @@ pub fn load_cert(id: &str) -> Option<(Vec<u8>, String)> {
     let json = unprotect(&raw)?;
     let blob: CertBlob = serde_json::from_slice(&json).ok()?;
     Some((b64_decode(&blob.pfx)?, blob.password))
+}
+
+/// 删掉 certs/<id>.bin 和同名的 .name。返回 .bin 是否真的删掉了。
+pub fn delete_cert(id: &str) -> bool {
+    let dir = certs_dir();
+    let ok = fs::remove_file(dir.join(format!("{id}.bin"))).is_ok();
+    let _ = fs::remove_file(dir.join(format!("{id}.name")));
+    ok
 }
 
 pub fn list_certs() -> Vec<CertInfo> {

@@ -16,14 +16,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 计算北京时间版本号
+      - name: 读取版本号
         id: ver
         shell: pwsh
         run: |
-          $dt = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId((Get-Date), 'China Standard Time')
-          $tag = $dt.ToString("yyyyMMdd-HHmmss")
-          Write-Host "version = $tag"
-          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          Write-Host "version = $ver"
+          echo "tag=v$ver" >> $env:GITHUB_OUTPUT
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
